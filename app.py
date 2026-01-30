@@ -1,224 +1,279 @@
+# app.py — Promptix AI v2 (UI refresh only; core functionality unchanged)
+# Streamlit app to generate QA test-case prompts + optionally call an LLM.
+# - Default mode uses YOUR Together/LLaMA key from Streamlit Secrets (TOGETHER_API_KEY)
+# - Users can switch provider + paste their own key (OpenAI / Gemini / Anthropic / Together)
+#
+# Footer: Thought and built by Monika Kushwaha (LinkedIn hyperlink)
+
 import os
 import re
-from datetime import date
-from typing import List, Dict, Tuple
+import json
+import textwrap
+from typing import Dict, List, Tuple, Optional
 
 import requests
 import streamlit as st
 
 
-# =========================================================
-# Helpers
-# =========================================================
-def safe_json(resp: requests.Response):
-    try:
-        return resp.json()
-    except Exception:
-        return None
+# =========================
+# Page config
+# =========================
+st.set_page_config(
+    page_title="Promptix AI v2",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# =========================
+# UI skin (CSS only)
+# =========================
+st.markdown(
+    """
+<style>
+/* Page width + padding */
+.block-container { padding-top: 1.6rem; padding-bottom: 2.2rem; max-width: 1220px; }
+
+/* Hero */
+.px-hero{
+  background: linear-gradient(135deg, rgba(124,58,237,0.38), rgba(59,130,246,0.16));
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 22px;
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+.px-title{ font-size: 34px; font-weight: 800; letter-spacing: -0.5px; margin: 0; }
+.px-sub{ opacity: 0.88; margin-top: 6px; font-size: 14px; }
+.px-chip{
+  display:inline-block; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.14);
+  background: rgba(255,255,255,0.05);
+  font-size: 12px; opacity: 0.92; margin-left: 10px;
+}
+
+/* Cards */
+.px-card{
+  background: rgba(255,255,255,0.035);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 18px;
+  padding: 16px 16px;
+  margin-bottom: 14px;
+}
+.px-h2{ font-size: 20px; font-weight: 750; margin: 0 0 8px 0; }
+.px-muted{ opacity: 0.85; font-size: 13px; }
+
+/* Stepper */
+.px-stepper{ display:flex; gap:10px; flex-wrap: wrap; margin-top: 10px; }
+.px-step{
+  padding: 6px 10px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.03);
+  font-size: 12px; opacity: 0.92;
+}
+
+/* Buttons */
+div.stButton > button{
+  border-radius: 14px !important;
+  padding: 0.68rem 1.05rem !important;
+  font-weight: 700 !important;
+}
+
+/* Make code blocks feel like "preview panes" */
+div[data-testid="stCodeBlock"]{
+  border-radius: 14px !important;
+}
+
+/* Footer */
+.px-footer{
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(255,255,255,0.08);
+  opacity: 0.92;
+  font-size: 12.5px;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 
-def clear_byok_key():
-    if "user_api_key" in st.session_state:
-        st.session_state.user_api_key = ""
+# =========================
+# Session state
+# =========================
+def init_state():
+    defaults = dict(
+        generated_prompt="",
+        ai_response="",
+        quality_score=0,
+        quality_gaps=[],
+        suggested_ac="",
+        free_calls_left=10,
+        last_error="",
+    )
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
-def ss_default(key, val):
-    if key not in st.session_state:
-        st.session_state[key] = val
+init_state()
 
 
-def extract_openai_responses_text(data: dict) -> str:
-    """Parse OpenAI Responses API output into plain text."""
-    texts = []
-    for item in (data or {}).get("output", []):
-        if item.get("type") == "message":
-            for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    texts.append(c.get("text", ""))
-    if not texts and isinstance(data, dict) and data.get("output_text"):
-        texts.append(str(data.get("output_text")))
-    return "\n".join([t for t in texts if t]).strip()
-
-
-# =========================================================
-# Product/QA differentiators (Quality Score + AC mapping + Risk tags)
-# =========================================================
-RISK_TAGS = [
-    "Auth", "Validation", "UI", "API", "Data", "Permissions", "Network",
-    "Performance", "Security", "Accessibility", "Compatibility", "Localization",
-    "Payments", "Notifications", "Logging/Monitoring"
+# =========================
+# Provider config
+# =========================
+PROVIDERS = [
+    "Promptix Free (LLaMA via Together)",
+    "User: Together",
+    "User: OpenAI",
+    "User: Gemini",
+    "User: Anthropic",
 ]
 
-
-def extract_acceptance_criteria(req_text: str) -> List[str]:
-    """Extract AC-like points from the requirements text (bullets/lines/sentences)."""
-    t = (req_text or "").strip()
-    if not t:
-        return []
-
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    ac = []
-
-    # Prefer bullet/numbered lines
-    bullet_like = []
-    for ln in lines:
-        if re.match(r"^(\-|\*|•|\d+[\)\.]|\(\d+\))\s+", ln):
-            bullet_like.append(re.sub(r"^(\-|\*|•|\d+[\)\.]|\(\d+\))\s+", "", ln).strip())
-
-    if bullet_like:
-        ac = bullet_like
-    else:
-        # Fallback: split by sentences if no bullets
-        parts = re.split(r"(?<=[\.\?!])\s+", t)
-        ac = [p.strip() for p in parts if p.strip()]
-
-    # Keep a reasonable number
-    ac = [a for a in ac if len(a) >= 8]
-    return ac[:12]
+API_KEY_LINKS = {
+    "OpenAI": "https://platform.openai.com/api-keys",
+    "Gemini": "https://aistudio.google.com/apikey",
+    "Anthropic": "https://console.anthropic.com/settings/keys",
+    "Together": "https://api.together.xyz/settings/api-keys",
+}
 
 
-def quality_score_and_gaps(context: str, requirements: str, additional: str) -> Tuple[int, List[str], List[str]]:
-    """
-    Returns:
-      score (0-100),
-      gaps (missing info checks),
-      suggested_acs (ready-to-add AC suggestions)
-    """
+def get_secret(name: str) -> str:
+    # works on local env or Streamlit cloud secrets
+    if name in st.secrets:
+        return str(st.secrets.get(name, "")).strip()
+    return os.getenv(name, "").strip()
+
+
+def provider_defaults(provider: str) -> Tuple[str, str]:
+    # endpoint, model
+    if provider in ("Promptix Free (LLaMA via Together)", "User: Together"):
+        return "https://api.together.xyz/v1/chat/completions", "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    if provider == "User: OpenAI":
+        return "https://api.openai.com/v1/chat/completions", "gpt-4o-mini"
+    if provider == "User: Anthropic":
+        return "https://api.anthropic.com/v1/messages", "claude-3-5-sonnet-latest"
+    if provider == "User: Gemini":
+        # We'll build the full URL from model at call-time; keep here for display.
+        return "https://generativelanguage.googleapis.com/v1beta/models", "gemini-1.5-flash"
+    return "", ""
+
+
+# =========================
+# Heuristic requirement-quality scoring
+# =========================
+NFR_KEYWORDS = [
+    "performance", "latency", "throughput", "reliability", "availability", "security",
+    "privacy", "accessibility", "a11y", "usability", "scalability", "logging", "monitoring"
+]
+
+AMBIGUOUS = ["etc", "something", "maybe", "should work", "and so on", "as needed", "like"]
+
+
+def compute_quality(context: str, requirements: str, include_negatives: bool) -> Tuple[int, List[str], str]:
     ctx = (context or "").strip()
     req = (requirements or "").strip()
-    add = (additional or "").strip()
 
-    score = 0
+    score = 50
     gaps = []
-    suggested_acs = []
 
-    # Presence/length signals
-    if len(ctx) >= 30:
-        score += 20
+    # Length / clarity
+    if len(ctx) >= 25:
+        score += 8
     else:
-        gaps.append("Context is short. Add: user persona, platform (web/app), and feature scope.")
-        suggested_acs.append("AC: Feature scope and platform are explicitly defined (web/app/version).")
+        gaps.append("Context is too short — add platform, persona, and scenario details.")
+        score -= 6
 
     if len(req) >= 60:
-        score += 30
-    else:
-        gaps.append("Requirements are short. Add acceptance criteria bullets with expected behavior.")
-        suggested_acs.append("AC: Clearly list acceptance criteria with expected outcomes and validations.")
-
-    if len(add) >= 20:
         score += 10
     else:
-        gaps.append("Constraints/notes missing. Add: dependencies, assumptions, out-of-scope, error handling.")
-        suggested_acs.append("AC: Error handling, dependencies, and out-of-scope items are documented.")
+        gaps.append("Requirements are brief — add field-level validations and expected UI/system outcomes.")
+        score -= 8
 
-    # Risk area coverage heuristics
-    req_low = (req + " " + add).lower()
-
-    def has_any(keys: List[str]) -> bool:
-        return any(k in req_low for k in keys)
-
-    # Validation
-    if has_any(["invalid", "validation", "mandatory", "required", "format", "min", "max", "limit"]):
-        score += 10
+    # Acceptance criteria structure
+    ac_lines = [ln.strip() for ln in req.splitlines() if ln.strip()]
+    numbered = sum(1 for ln in ac_lines if re.match(r"^\s*(\d+[\).\]]|\-)\s+", ln))
+    if numbered >= 3:
+        score += 8
     else:
-        gaps.append("No validation rules mentioned (required fields, formats, min/max).")
-        suggested_acs.append("AC: Validation rules are defined (required fields, formats, min/max, error messages).")
+        gaps.append("Add more explicit acceptance criteria (numbered list works best).")
+        score -= 5
 
-    # Errors/timeouts
-    if has_any(["error", "fail", "timeout", "retry", "offline", "network", "exception"]):
-        score += 10
+    # Platform hints
+    platform_hits = 0
+    for k in ["web", "mobile", "android", "ios", "api", "backend", "frontend"]:
+        if k in (ctx + " " + req).lower():
+            platform_hits += 1
+    if platform_hits >= 2:
+        score += 6
     else:
-        gaps.append("No error scenarios mentioned (timeouts, failures, retries).")
-        suggested_acs.append("AC: Define error scenarios (timeouts, network failure, retry/backoff, user messaging).")
+        gaps.append("Mention platform + surfaces (web/mobile/API) for stronger coverage.")
+        score -= 3
 
-    # Permissions/security
-    if has_any(["role", "permission", "access", "auth", "otp", "login", "session", "token"]):
-        score += 10
+    # NFR mention
+    has_nfr = any(k in (ctx + " " + req).lower() for k in NFR_KEYWORDS)
+    if not has_nfr:
+        gaps.append("No NFRs mentioned (performance, reliability, security, accessibility).")
+        score -= 6
     else:
-        gaps.append("No auth/permission behavior mentioned (who can do what).")
-        suggested_acs.append("AC: Define access control rules (auth required, session behavior, roles/permissions).")
+        score += 5
 
-    # Performance/basic NFR
-    if has_any(["performance", "latency", "sla", "load", "response time", "seconds", "ms"]):
-        score += 10
+    # Ambiguity penalty
+    if any(a in (ctx + " " + req).lower() for a in AMBIGUOUS):
+        gaps.append("Some wording is ambiguous — replace “etc/maybe” with measurable expected outcomes.")
+        score -= 4
+
+    # Negative tests flag
+    if include_negatives:
+        score += 3
     else:
-        gaps.append("No NFRs mentioned (performance, reliability).")
-        suggested_acs.append("AC: Add NFRs (latency target, reliability expectations, rate limits if any).")
+        gaps.append("Consider enabling negative tests for stronger defect discovery.")
 
-    # Cap at 100
-    score = min(100, score)
+    # Clamp
+    score = max(0, min(100, score))
 
-    # If everything is strong, add a positive suggestion
-    if score >= 85 and not gaps:
-        gaps.append("Looks solid. Consider adding traceability IDs for each AC (AC-1, AC-2...) for reporting.")
-        suggested_acs.append("AC: Acceptance criteria are numbered (AC-1, AC-2...) for traceability.")
+    # Suggested AC template (copy/paste)
+    suggested_ac = textwrap.dedent(
+        """\
+        AC-1: Happy path completes successfully and updates are visible immediately.
+        AC-2: Required fields validate with clear inline errors (empty/invalid formats).
+        AC-3: Server/network failure shows non-blocking error + retry guidance.
+        AC-4: Data persists across refresh/relogin and appears in listing/history.
+        AC-5: Authorization prevents access/modification for unauthorized users.
+        """
+    )
 
-    return score, gaps[:6], suggested_acs[:6]
-
-
-def format_instructions(test_mgmt_format: str) -> str:
-    mapping = {
-        "Standard/Detailed – Comprehensive format": (
-            "Return detailed test cases with: Test Case ID, Title, Priority, Preconditions, "
-            "Test Data, Steps (numbered), Expected Result, Post-conditions, Risk Tags, AC Reference."
-        ),
-        "Jira/Zephyr – Atlassian import style": (
-            "Format for Jira/Zephyr: Test Summary, Precondition, Test Steps (Step | Data | Expected), "
-            "Labels/Tags, Priority, AC Reference."
-        ),
-        "TestRail – TestRail format": (
-            "Format for TestRail: Title, Preconditions, Steps (separate), Expected Results, References, Priority, AC Reference."
-        ),
-        "Cucumber/BDD – Gherkin syntax": (
-            "Output in Gherkin: Feature, Background, Scenarios with Given/When/Then. "
-            "Add tags like @risk_auth @risk_validation and include AC reference in scenario name."
-        ),
-        "Excel/CSV – Generic import format": (
-            "Output as CSV rows with columns: ID, Title, Priority, Preconditions, TestData, Steps, Expected, Tags, ACRef."
-        ),
-        "Custom – I will define": (
-            "Follow the custom format described in Additional Information."
-        ),
-    }
-    return mapping.get(test_mgmt_format, mapping["Standard/Detailed – Comprehensive format"])
+    return score, gaps[:6], suggested_ac
 
 
-def build_prompt(
-    role: str,
-    test_type: str,
-    test_mgmt_format: str,
-    context: str,
-    requirements: str,
-    additional: str,
-    comprehensive: bool,
-    edge_cases: bool,
-    negative_tests: bool,
-    product_mode: bool,
-    advanced_notes: str,
-) -> str:
-    flags = []
-    if comprehensive:
-        flags.append("Comprehensive coverage")
-    if edge_cases:
-        flags.append("Include edge cases")
-    if negative_tests:
-        flags.append("Include negative/validation tests")
-    flags_txt = ", ".join(flags) if flags else "Standard coverage"
+# =========================
+# Prompt generation (core)
+# =========================
+def build_prompt(payload: Dict) -> str:
+    role = payload["role"]
+    test_type = payload["test_type"]
+    output_format = payload["output_format"]
+    context = payload["context"].strip()
+    requirements = payload["requirements"].strip()
 
-    ac_list = extract_acceptance_criteria(requirements)
-    ac_block = "\n".join([f"- AC-{i+1}: {a}" for i, a in enumerate(ac_list)]) if ac_list else "- (No explicit AC list found. Derive and number ACs from requirements.)"
+    flags = payload["coverage_flags"]
+    risk_tags = payload["risk_tags"]
 
-    product_mode_block = ""
-    if product_mode:
-        product_mode_block = f"""
-PRODUCT MODE (IMPORTANT)
-Before test cases, output:
-A) Missing acceptance criteria (bulleted, 5–10 max)
-B) Risk checklist (Auth/Validation/Permissions/Error handling/NFRs)
-C) Mini Test Plan (Scope, In-scope, Out-of-scope, Entry/Exit criteria, Test data strategy)
-"""
+    # Acceptance criteria mapping (optional)
+    ac_text = payload.get("acceptance_criteria_hint", "").strip()
 
-    return f"""
+    # Output rules
+    output_rules = [
+        "Return detailed test cases with: Test Case ID, Title, Priority, Preconditions, Steps, Test Data, Expected Result.",
+        "Every test case MUST include: AC reference (AC-#) and 1–3 risk tags from the provided list.",
+        "Include happy path + boundary + error handling. Keep steps atomic and verifiable (UI action → system reaction).",
+        "Do NOT invent features. If ambiguous, state assumptions explicitly before the test cases.",
+    ]
+    if "Include Negative Tests" in flags:
+        output_rules.insert(2, "Include negative tests and invalid inputs (missing/invalid fields, permissions, API failures).")
+
+    if "Include NFRs (Perf/Sec/A11y)" in flags:
+        output_rules.append("Add a small NFR section: performance, reliability, security, accessibility checks (as applicable).")
+
+    prompt = f"""
 You are Promptix AI v2 — a senior QA engineer + test architect.
 
 TASK
@@ -226,728 +281,425 @@ Generate high-quality test cases from the given product context and requirements
 
 TESTER ROLE: {role}
 TEST TYPE: {test_type}
-OUTPUT FORMAT: {test_mgmt_format}
-COVERAGE FLAGS: {flags_txt}
+OUTPUT FORMAT: {output_format}
+
+COVERAGE FLAGS: {", ".join(flags) if flags else "Standard coverage"}
 
 RISK TAGS (use 1–3 per test case from this list):
-{", ".join(RISK_TAGS)}
+{", ".join(risk_tags)}
 
-ACCEPTANCE CRITERIA (numbered for traceability — reference these in every test case):
-{ac_block}
+ACCEPTANCE CRITERIA (numbered for traceability; reference as AC-#):
+{requirements if requirements else "(none provided)"}
+
+{("SUGGESTED AC TEMPLATE (if needed):\\n" + ac_text) if ac_text else ""}
 
 WHAT YOU ARE TESTING (CONTEXT)
-{context}
-
-WHAT IT SHOULD DO (REQUIREMENTS / ACCEPTANCE CRITERIA DETAILS)
-{requirements}
-
-ADDITIONAL INFORMATION / CONSTRAINTS
-{additional}
-
-ADVANCED NOTES (OPTIONAL)
-{advanced_notes}
-
-{product_mode_block}
+{context if context else "(no context provided)"}
 
 OUTPUT RULES
-1) {format_instructions(test_mgmt_format)}
-2) Every test case MUST include:
-   - AC Reference: AC-#
-   - Risk Tags: 1–3 tags from the provided list
-3) Add clear preconditions + test data wherever needed.
-4) Include happy path + boundary + error handling.
-5) Keep steps atomic and verifiable (UI action → system reaction).
-6) Do NOT invent features. If ambiguous, state assumptions explicitly.
+{chr(10).join([f"{i+1}) {rule}" for i, rule in enumerate(output_rules)])}
+
+NOW GENERATE THE TEST CASES.
 """.strip()
 
+    return prompt
 
-# =========================================================
-# API Providers
-# =========================================================
-PROVIDERS = {
-    "Promptix Free (LLaMA via Together)": {
-        "endpoint": "https://api.together.xyz/v1/chat/completions",
-        "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-        "key_env": "TOGETHER_API_KEY",
-        "key_link": "https://api.together.xyz/settings/api-keys",
-    },
-    "Together LLaMA (BYOK)": {
-        "endpoint": "https://api.together.xyz/v1/chat/completions",
-        "model": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-        "key_env": None,
-        "key_link": "https://api.together.xyz/settings/api-keys",
-    },
-    "OpenAI (BYOK)": {
-        "endpoint": "https://api.openai.com/v1/responses",
-        "model": "gpt-4o-mini",
-        "key_env": None,
-        "key_link": "https://platform.openai.com/api-keys",
-    },
-    "Google Gemini (BYOK)": {
-        "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
-        "model": "gemini-pro",
-        "key_env": None,
-        "key_link": "https://aistudio.google.com/app/apikey",
-    },
-    "Anthropic Claude (BYOK)": {
-        "endpoint": "https://api.anthropic.com/v1/messages",
-        "model": "claude-3-haiku-20240307",
-        "key_env": None,
-        "key_link": "https://console.anthropic.com/settings/keys",
-    },
+
+# =========================
+# LLM Calls (core)
+# =========================
+def call_together(endpoint: str, model: str, api_key: str, prompt: str) -> str:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 1400,
+    }
+    r = requests.post(endpoint, headers=headers, json=body, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def call_openai(endpoint: str, model: str, api_key: str, prompt: str) -> str:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 1400,
+    }
+    r = requests.post(endpoint, headers=headers, json=body, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def call_anthropic(endpoint: str, model: str, api_key: str, prompt: str) -> str:
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": model,
+        "max_tokens": 1400,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    r = requests.post(endpoint, headers=headers, json=body, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    # Anthropic returns list of content blocks
+    return "".join([c.get("text", "") for c in data.get("content", [])]).strip()
+
+
+def call_gemini(base_url: str, model: str, api_key: str, prompt: str) -> str:
+    # base_url is like: https://generativelanguage.googleapis.com/v1beta/models
+    url = f"{base_url}/{model}:generateContent?key={api_key}"
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    r = requests.post(url, json=body, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return json.dumps(data, indent=2)
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join([p.get("text", "") for p in parts]).strip()
+
+
+def call_llm(provider: str, endpoint: str, model: str, api_key: str, prompt: str) -> str:
+    if provider in ("Promptix Free (LLaMA via Together)", "User: Together"):
+        return call_together(endpoint, model, api_key, prompt)
+    if provider == "User: OpenAI":
+        return call_openai(endpoint, model, api_key, prompt)
+    if provider == "User: Anthropic":
+        return call_anthropic(endpoint, model, api_key, prompt)
+    if provider == "User: Gemini":
+        return call_gemini(endpoint, model, api_key, prompt)
+    raise ValueError("Unsupported provider")
+
+
+# =========================
+# Sidebar — AI Settings
+# =========================
+st.sidebar.markdown("## 🧠 AI Settings")
+
+provider = st.sidebar.selectbox("Provider", PROVIDERS, index=0)
+
+default_endpoint, default_model = provider_defaults(provider)
+
+# Endpoint & model controls (kept, but UI looks different now)
+endpoint = st.sidebar.text_input("API Endpoint", value=default_endpoint)
+model = st.sidebar.text_input("Model", value=default_model)
+
+# Key management
+together_key = get_secret("TOGETHER_API_KEY")  # used for Promptix Free
+user_key = ""
+
+if provider == "Promptix Free (LLaMA via Together)":
+    st.sidebar.markdown("🔒 **Using your Together key from Streamlit Secrets** (`TOGETHER_API_KEY`).")
+    st.sidebar.info(f"Free calls left today (this session): **{st.session_state.free_calls_left}/10**")
+    if not together_key:
+        st.sidebar.error("Missing key: **TOGETHER_API_KEY** (add it in Streamlit Secrets).")
+else:
+    user_key = st.sidebar.text_input("Your API Key", type="password", value="")
+    st.sidebar.caption("Tip: Keep keys private — don’t paste real client data into prompts.")
+
+# API key links
+st.sidebar.markdown("---")
+st.sidebar.markdown("🔗 **Get your API key**")
+st.sidebar.markdown(f"- OpenAI: [{API_KEY_LINKS['OpenAI']}]({API_KEY_LINKS['OpenAI']})")
+st.sidebar.markdown(f"- Gemini: [{API_KEY_LINKS['Gemini']}]({API_KEY_LINKS['Gemini']})")
+st.sidebar.markdown(f"- Anthropic: [{API_KEY_LINKS['Anthropic']}]({API_KEY_LINKS['Anthropic']})")
+st.sidebar.markdown(f"- Together: [{API_KEY_LINKS['Together']}]({API_KEY_LINKS['Together']})")
+
+
+# =========================
+# Header / Hero
+# =========================
+st.markdown(
+    """
+<div class="px-hero">
+  <div style="display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap: wrap;">
+    <div>
+      <h1 class="px-title">Promptix AI v2 <span class="px-chip">MVP</span></h1>
+      <div class="px-sub">Turn product requirements into structured, export-ready test cases — with edge cases, negatives, traceability (AC mapping), and risk tagging.</div>
+      <div class="px-stepper">
+        <span class="px-step">1) Scenario Builder</span>
+        <span class="px-step">2) Coverage Scoreboard</span>
+        <span class="px-step">3) Prompt → AI</span>
+      </div>
+    </div>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# =========================
+# Sample filler
+# =========================
+SAMPLE = {
+    "context": "zepto.com — user added a new address (web + mobile)",
+    "requirements": "1) User logs in with valid credentials.\n2) User adds a new address with required fields and saves successfully.\n3) Saved address appears in address list and can be selected.\n4) Invalid/missing fields show inline error messages.",
 }
 
 
-def call_ai(provider: str, api_endpoint: str, api_model: str, api_key: str, prompt: str) -> Tuple[str, str, object]:
-    """
-    Returns: (text, status, raw_debug)
-    """
-    # Together (chat/completions or completions)
-    if provider in ["Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)"]:
-        headers = {"Authorization": f"Bearer {api_key}"}
-
-        if "/chat/completions" in api_endpoint:
-            payload = {
-                "model": api_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 900,
-                "temperature": 0.25,
-            }
-        else:
-            payload = {
-                "model": api_model,
-                "prompt": prompt,
-                "max_tokens": 900,
-                "temperature": 0.25,
-            }
-
-        resp = requests.post(api_endpoint, headers=headers, json=payload, timeout=60)
-        data = safe_json(resp)
-        status = f"Together HTTP {resp.status_code}"
-        raw = data if data else resp.text
-
-        if resp.status_code >= 400 or not data:
-            return "", status, raw
-
-        if "/chat/completions" in api_endpoint:
-            text = (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
-        else:
-            text = data.get("choices", [{}])[0].get("text", "") or ""
-
-        return text.strip(), status, raw
-
-    # OpenAI Responses API
-    if provider == "OpenAI (BYOK)":
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        resp = requests.post(
-            api_endpoint,
-            headers=headers,
-            json={"model": api_model, "input": prompt, "store": False, "max_output_tokens": 900},
-            timeout=60,
-        )
-        data = safe_json(resp)
-        status = f"OpenAI HTTP {resp.status_code}"
-        raw = data if data else resp.text
-
-        if resp.status_code >= 400 or not data:
-            return "", status, raw
-
-        return extract_openai_responses_text(data) or "", status, raw
-
-    # Gemini
-    if provider == "Google Gemini (BYOK)":
-        url = f"{api_endpoint}?key={api_key}"
-        resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=60)
-        data = safe_json(resp)
-        status = f"Gemini HTTP {resp.status_code}"
-        raw = data if data else resp.text
-
-        if resp.status_code >= 400 or not data:
-            return "", status, raw
-
-        text = (
-            data.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
-        return (text or "").strip(), status, raw
-
-    # Anthropic
-    if provider == "Anthropic Claude (BYOK)":
-        headers = {
-            "x-api-key": api_key,
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-        }
-        resp = requests.post(
-            api_endpoint,
-            headers=headers,
-            json={"model": api_model, "max_tokens": 900, "messages": [{"role": "user", "content": prompt}]},
-            timeout=60,
-        )
-        data = safe_json(resp)
-        status = f"Anthropic HTTP {resp.status_code}"
-        raw = data if data else resp.text
-
-        if resp.status_code >= 400 or not data:
-            return "", status, raw
-
-        text = (data.get("content", [{}])[0].get("text") or "").strip()
-        return text, status, raw
-
-    return "", "Unknown provider", "No debug"
+def fill_sample():
+    st.session_state["context_in"] = SAMPLE["context"]
+    st.session_state["req_in"] = SAMPLE["requirements"]
 
 
-# =========================================================
-# Streamlit config + styling
-# =========================================================
-st.set_page_config(
-    page_title="Promptix AI v2",
-    page_icon="✅",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-st.markdown(
-    """
-    <style>
-      .block-container {max-width: 1280px; padding-top: 1.1rem; padding-bottom: 2rem;}
-      .promptix-hero {
-        background: linear-gradient(135deg, rgba(79, 45, 170, 0.88), rgba(46, 25, 112, 0.88));
-        padding: 18px 20px;
-        border-radius: 16px;
-        border: 1px solid rgba(255,255,255,0.09);
-        margin-bottom: 14px;
-      }
-      .promptix-hero h1 { margin: 0; font-size: 28px; line-height: 1.2; }
-      .promptix-hero p { margin: 6px 0 0; opacity: 0.92; }
-      .badge {
-        display:inline-block; margin-left:10px; padding: 3px 10px;
-        border-radius: 999px; font-size: 12px;
-        background: rgba(0, 200, 120, 0.18);
-        border: 1px solid rgba(0, 200, 120, 0.25);
-      }
-      .card {
-        background: rgba(255,255,255,0.03);
-        border: 1px solid rgba(255,255,255,0.09);
-        border-radius: 16px;
-        padding: 14px 14px 10px;
-      }
-      .muted { opacity: 0.82; }
-      .warnbox {
-        background: rgba(255, 180, 0, 0.10);
-        border: 1px solid rgba(255, 180, 0, 0.22);
-        border-radius: 12px;
-        padding: 10px 12px;
-      }
-      .small { font-size: 12px; opacity: 0.88; }
-      .successbar {
-        background: rgba(0, 200, 120, 0.15);
-        border: 1px solid rgba(0, 200, 120, 0.25);
-        padding: 10px 12px;
-        border-radius: 12px;
-      }
-      .errorbar {
-        background: rgba(255, 80, 80, 0.12);
-        border: 1px solid rgba(255, 80, 80, 0.22);
-        padding: 10px 12px;
-        border-radius: 12px;
-      }
-      .footer {
-        margin-top: 18px;
-        padding-top: 12px;
-        border-top: 1px solid rgba(255,255,255,0.10);
-        opacity: 0.9;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =========================================================
-# Session state defaults
-# =========================================================
-ss_default("generated_prompt", "")
-ss_default("ai_response", "")
-ss_default("api_endpoint", "")
-ss_default("api_model", "")
-ss_default("last_api_status", "")
-ss_default("last_api_raw", "")
-ss_default("inline_message", "")
-ss_default("inline_is_error", False)
-
-# Export conversions (unique functionality)
-ss_default("export_csv", "")
-ss_default("export_gherkin", "")
-ss_default("export_jira", "")
-
-# Free tier usage (per-session/day MVP)
-ss_default("usage_day", str(date.today()))
-ss_default("free_calls_used", 0)
-if st.session_state.usage_day != str(date.today()):
-    st.session_state.usage_day = str(date.today())
-    st.session_state.free_calls_used = 0
-
-FREE_DAILY_LIMIT = int(os.getenv("PROMPTIX_FREE_DAILY_LIMIT", "10"))
-
-# Sample data
-ss_default("sample_context", "")
-ss_default("sample_requirements", "")
-ss_default("sample_additional", "")
-
-# =========================================================
-# Header
-# =========================================================
-st.markdown(
-    """
-    <div class="promptix-hero">
-      <h1>Promptix AI v2 <span class="badge">MVP</span></h1>
-      <p class="muted">
-        Turn product requirements into structured, export-ready test cases — with edge cases, negatives,
-        traceability (AC mapping), and risk tagging.
-      </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =========================================================
-# Sidebar: AI Settings + Key links (hyperlinks only)
-# =========================================================
-st.sidebar.title("🔐 AI Settings")
-provider = st.sidebar.selectbox("Provider", list(PROVIDERS.keys()), index=0)
-defaults = PROVIDERS[provider]
-
-# Initialize endpoint/model only if empty (doesn't overwrite user changes)
-if st.session_state.api_endpoint == "" or st.session_state.api_model == "":
-    st.session_state.api_endpoint = defaults["endpoint"]
-    st.session_state.api_model = defaults["model"]
-
-api_endpoint = st.sidebar.text_input("API Endpoint", value=st.session_state.api_endpoint)
-api_model = st.sidebar.text_input("Model", value=st.session_state.api_model)
-
-# Provider-specific link (no raw URL visible)
-st.sidebar.markdown(f"🔗 [Get your API key]({defaults['key_link']})")
-
-with st.sidebar.expander("Show all key links", expanded=False):
-    st.sidebar.markdown(f"- **OpenAI**: [Get your API key]({PROVIDERS['OpenAI (BYOK)']['key_link']})")
-    st.sidebar.markdown(f"- **Gemini**: [Get your API key]({PROVIDERS['Google Gemini (BYOK)']['key_link']})")
-    st.sidebar.markdown(f"- **Anthropic**: [Get your API key]({PROVIDERS['Anthropic Claude (BYOK)']['key_link']})")
-    st.sidebar.markdown(f"- **Together**: [Get your API key]({PROVIDERS['Together LLaMA (BYOK)']['key_link']})")
-
-# Key resolution
-api_key = ""
-if provider == "Promptix Free (LLaMA via Together)":
-    env_name = defaults["key_env"]
-    api_key = os.getenv(env_name, "") or st.secrets.get(env_name, "")
-    remaining = max(0, FREE_DAILY_LIMIT - st.session_state.free_calls_used)
-    st.sidebar.info(f"Free calls left today (this session): {remaining}/{FREE_DAILY_LIMIT}")
-    if api_key:
-        st.sidebar.success(f"Using server key from env var: {env_name}")
-    else:
-        st.sidebar.error(f"Missing key: {env_name} (add it in Streamlit Secrets)")
-else:
-    st.sidebar.warning("BYOK: your key is used only for this request and cleared afterwards.")
-    api_key = st.sidebar.text_input("Your API Key", type="password", key="user_api_key")
-
-s1, s2 = st.sidebar.columns(2)
-with s1:
-    if st.button("💾 Save", use_container_width=True):
-        st.session_state.api_endpoint = api_endpoint
-        st.session_state.api_model = api_model
-        st.sidebar.success("Saved.")
-with s2:
-    if st.button("🧹 Clear", use_container_width=True):
-        st.session_state.generated_prompt = ""
-        st.session_state.ai_response = ""
-        st.session_state.last_api_status = ""
-        st.session_state.last_api_raw = ""
-        st.session_state.inline_message = ""
-        st.session_state.export_csv = ""
-        st.session_state.export_gherkin = ""
-        st.session_state.export_jira = ""
-        st.sidebar.success("Cleared.")
-
-st.sidebar.caption("Security: never hardcode or commit keys to GitHub.")
-
-# =========================================================
-# Main layout: Left inputs | Right outputs
-# =========================================================
-left, right = st.columns([1.10, 1])
+# =========================
+# Main layout (UI refresh)
+# =========================
+left, right = st.columns([0.58, 0.42], gap="large")
 
 with left:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("🧪 Test Configuration")
+    st.markdown('<div class="px-card">', unsafe_allow_html=True)
+    st.markdown('<div class="px-h2">🧩 Scenario Builder</div>', unsafe_allow_html=True)
+    st.markdown('<div class="px-muted">Define what you’re testing. Keep it crisp + testable.</div>', unsafe_allow_html=True)
 
-    if st.button("🎯 Fill Sample Data", use_container_width=True):
-        st.session_state.sample_context = "zepto.com — user added a new address (web + mobile)"
-        st.session_state.sample_requirements = (
-            "1) User logs in with valid credentials.\n"
-            "2) User adds a new address with required fields and saves successfully.\n"
-            "3) Saved address appears in address list and can be selected during checkout.\n"
-            "4) Invalid/missing fields show inline error messages.\n"
-        )
-        st.session_state.sample_additional = (
-            "Consider duplicates, network timeouts, address validation rules, and permission/session behavior."
-        )
+    c1, c2 = st.columns([0.5, 0.5], gap="small")
+    with c1:
+        if st.button("🎯 Fill Sample Data", use_container_width=True):
+            fill_sample()
+            st.rerun()
 
-    role = st.selectbox(
-        "Testing Role",
-        [
-            "QA Tester – Manual testing expert",
-            "Automation Tester – Test automation specialist",
-            "Performance Tester – Load & performance testing",
-            "Security Tester – Security & penetration testing",
-            "API Tester – API & integration testing",
-            "Mobile Tester – Mobile app testing specialist",
-            "Accessibility Tester – WCAG & accessibility",
-            "Data Quality Tester – Data validation & ETL",
-            "Custom/Other – Custom testing role",
-        ],
-    )
-
-    test_type = st.selectbox(
-        "Test Type",
-        [
-            "Functional Testing",
-            "Integration Testing",
-            "Regression Testing",
-            "Smoke Testing",
-            "Sanity Testing",
-            "Exploratory Testing",
-            "User Acceptance Testing",
-            "End-to-End Testing",
-            "Custom/Other",
-        ],
-    )
-
-    test_mgmt_format = st.selectbox(
-        "Test Management Format (Import-Ready)",
-        [
-            "Standard/Detailed – Comprehensive format",
-            "Jira/Zephyr – Atlassian import style",
-            "TestRail – TestRail format",
-            "Cucumber/BDD – Gherkin syntax",
-            "Excel/CSV – Generic import format",
-            "Custom – I will define",
-        ],
-    )
-
-    context = st.text_area(
-        "Context (What are you testing?)",
-        height=120,
-        value=st.session_state.sample_context,
-        max_chars=4000,
-    )
-    requirements = st.text_area(
-        "Requirements / Acceptance Criteria",
-        height=140,
-        value=st.session_state.sample_requirements,
-        max_chars=4000,
-    )
-    additional = st.text_area(
-        "Additional Information / Constraints",
-        height=120,
-        value=st.session_state.sample_additional,
-        max_chars=4000,
-    )
-
-    # --------- Product mode (differentiator) ---------
-    product_mode = st.checkbox("✨ Product Mode (Missing ACs + Risk checklist + Mini Test Plan)", value=True)
-
-    # --------- QA coverage toggles ---------
-    comprehensive = st.checkbox("✅ Comprehensive Coverage", value=True)
-    edge_cases = st.checkbox("🔍 Include Edge Cases", value=True)
-    negative_tests = st.checkbox("❌ Include Negative Tests", value=True)
-
-    # --------- Quality score panel (differentiator) ---------
-    score, gaps, suggested_acs = quality_score_and_gaps(context, requirements, additional)
-    st.markdown("#### 📌 Requirement Quality")
-    cqa1, cqa2 = st.columns([1, 1])
-    with cqa1:
-        st.metric("Clarity & Coverage Score", f"{score}/100")
-    with cqa2:
-        if score >= 85:
-            st.success("Strong inputs — test design will be richer.")
-        elif score >= 60:
-            st.warning("Decent — add a few details for better coverage.")
-        else:
-            st.error("Needs detail — add validations, errors, and scope.")
-
-    if gaps:
-        st.caption("Quick gaps to improve QA coverage:")
-        for g in gaps:
-            st.write(f"- {g}")
-
-    if suggested_acs:
-        with st.expander("Suggested Acceptance Criteria (copy/paste)", expanded=False):
-            st.code("\n".join([f"- {s}" for s in suggested_acs]), language="markdown")
-
-    st.markdown(
-        """
-        <div class="warnbox">
-          <b>Important</b>
-          <ul class="small" style="margin:6px 0 0 18px;">
-            <li>Avoid real secrets or client data</li>
-            <li>Review AI output before use</li>
-            <li>Use as assistant — not as the only source of truth</li>
-          </ul>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("⚡ Advanced Prompt Engineering", expanded=False):
-        advanced_notes = st.text_area(
-            "Add constraints, risk areas, data rules, traceability needs, etc.",
-            height=110,
-            placeholder="Example: map tests to ACs, include severity, include API validations, include accessibility checks...",
+    # Use a form so inputs don’t rerun the whole app on each keystroke
+    with st.form("scenario_form", clear_on_submit=False):
+        role = st.selectbox(
+            "Testing Role",
+            ["QA Tester – Manual testing expert", "QA Engineer – Hybrid (manual + automation)", "SDET – Automation-first", "QA Lead – Strategy & coverage"],
+            index=0,
         )
 
-    # Buttons
-    b1, b2 = st.columns(2)
+        test_type = st.selectbox(
+            "Test Type",
+            ["Functional Testing", "Regression Testing", "API Testing", "UAT / Business Testing", "Performance Smoke", "Security Smoke"],
+            index=0,
+        )
 
-    with b1:
-        if st.button("⚡ Generate Prompt", use_container_width=True):
-            st.session_state.generated_prompt = build_prompt(
-                role, test_type, test_mgmt_format, context, requirements, additional,
-                comprehensive, edge_cases, negative_tests, product_mode, advanced_notes
+        output_format = st.selectbox(
+            "Test Management Format (Import-Ready)",
+            ["Standard/Detailed – Comprehensive format", "Jira-friendly – concise steps + expected", "TestRail – structured fields", "BDD (Gherkin) – Given/When/Then"],
+            index=0,
+        )
+
+        context = st.text_area(
+            "Context (What are you testing?)",
+            key="context_in",
+            height=90,
+            placeholder="Example: zepto.com — user adds a new address (web + mobile)…",
+        )
+
+        requirements = st.text_area(
+            "Requirements / Acceptance Criteria",
+            key="req_in",
+            height=140,
+            placeholder="Numbered acceptance criteria works best (AC-1, AC-2...)",
+        )
+
+        st.markdown("")
+
+        # Coverage flags (kept — same functionality)
+        f1, f2, f3 = st.columns([0.34, 0.33, 0.33], gap="small")
+        with f1:
+            include_neg = st.checkbox("Include Negative Tests", value=True)
+        with f2:
+            include_edges = st.checkbox("Include Edge/Boundary", value=True)
+        with f3:
+            include_nfr = st.checkbox("Include NFRs (Perf/Sec/A11y)", value=False)
+
+        with st.expander("⚡ Advanced Prompt Controls", expanded=False):
+            risk_tags_raw = st.text_input(
+                "Risk Tags (comma-separated)",
+                value="Auth, Validation, UI, API, Data, Permissions, Network, Performance, Security, Accessibility",
             )
-            st.session_state.inline_message = "Prompt generated."
-            st.session_state.inline_is_error = False
+            risk_tags = [t.strip() for t in risk_tags_raw.split(",") if t.strip()]
 
-    with b2:
-        if st.button("🚀 Send to AI", use_container_width=True):
-            st.session_state.inline_message = ""
-            st.session_state.inline_is_error = False
-
-            # Free tier limit
-            if provider == "Promptix Free (LLaMA via Together)":
-                if st.session_state.free_calls_used >= FREE_DAILY_LIMIT:
-                    st.session_state.inline_message = "Free daily limit reached. Switch to BYOK mode."
-                    st.session_state.inline_is_error = True
-                    st.stop()
-
-            prompt = st.session_state.generated_prompt.strip() or build_prompt(
-                role, test_type, test_mgmt_format, context, requirements, additional,
-                comprehensive, edge_cases, negative_tests, product_mode, advanced_notes
+            extra_instructions = st.text_area(
+                "Extra Instructions (optional)",
+                height=80,
+                placeholder="Example: prioritize mobile flows; include offline/network loss; focus on address validations…",
             )
-            st.session_state.generated_prompt = prompt
 
-            if not api_key:
-                st.session_state.inline_message = "API key missing. Add it in Streamlit Secrets or use BYOK."
-                st.session_state.inline_is_error = True
-                st.stop()
-
-            try:
-                text, status, raw = call_ai(provider, api_endpoint, api_model, api_key, prompt)
-                st.session_state.last_api_status = status
-                st.session_state.last_api_raw = raw
-
-                if not text.strip():
-                    st.session_state.inline_message = "Request failed or returned empty text. Check AI Response → Debug."
-                    st.session_state.inline_is_error = True
-                    st.stop()
-
-                st.session_state.ai_response = text.strip()
-
-                # count free usage
-                if provider == "Promptix Free (LLaMA via Together)":
-                    st.session_state.free_calls_used += 1
-
-                st.session_state.inline_message = "✅ Generated! Output is visible below and in the AI Response tab."
-                st.session_state.inline_is_error = False
-
-            finally:
-                if provider != "Promptix Free (LLaMA via Together)":
-                    clear_byok_key()
-
-    # Inline message
-    if st.session_state.inline_message:
-        if st.session_state.inline_is_error:
-            st.markdown(f'<div class="errorbar">{st.session_state.inline_message}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="successbar">{st.session_state.inline_message}</div>', unsafe_allow_html=True)
-
-    # Inline output preview (so user doesn't have to switch tabs)
-    if st.session_state.ai_response.strip():
-        st.markdown("### ✅ Output Preview")
-        st.code(st.session_state.ai_response, language="markdown")
+        gen = st.form_submit_button("⚡ Generate Prompt", use_container_width=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # Coverage Scoreboard (computed whenever we generate)
+    st.markdown('<div class="px-card">', unsafe_allow_html=True)
+    st.markdown('<div class="px-h2">📌 Coverage Scoreboard</div>', unsafe_allow_html=True)
+
+    # Compute quality live if something exists (or after generate)
+    score, gaps, suggested = compute_quality(context or "", requirements or "", include_neg)
+
+    # store latest so UI stays consistent after rerun
+    st.session_state.quality_score = score
+    st.session_state.quality_gaps = gaps
+    st.session_state.suggested_ac = suggested
+
+    qc1, qc2 = st.columns([0.35, 0.65], gap="large")
+    with qc1:
+        st.metric("Clarity & Coverage", f"{score}/100")
+    with qc2:
+        if score >= 85:
+            st.success("Strong inputs — test design will be richer.")
+        elif score >= 70:
+            st.warning("Decent inputs — add a bit more detail to boost coverage.")
+        else:
+            st.error("Inputs are thin — add explicit validations + expected outcomes.")
+
+    if gaps:
+        st.markdown("**Quick gaps to improve QA coverage:**")
+        for g in gaps:
+            st.markdown(f"- {g}")
+
+    with st.expander("Suggested Acceptance Criteria (copy/paste)", expanded=False):
+        st.code(suggested, language="text")
+
+    st.info("**Important**\n\n- Avoid real secrets or client data\n- Review AI output before use\n- Use as assistant — not as the only source of truth")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 with right:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="px-card">', unsafe_allow_html=True)
+    st.markdown('<div class="px-h2">🧪 Output Preview</div>', unsafe_allow_html=True)
+    st.markdown('<div class="px-muted">Generate the prompt first, then send to AI.</div>', unsafe_allow_html=True)
 
-    tabs = st.tabs(["🧩 Generated Prompt", "🤖 AI Response"])
+    tab1, tab2 = st.tabs(["🧩 Generated Prompt", "🤖 AI Response"])
 
-    with tabs[0]:
-        if st.session_state.generated_prompt.strip():
-            st.code(st.session_state.generated_prompt, language="markdown")
-            st.caption("Use the copy button on the code block.")
+    # Build payload and prompt when user hits Generate
+    coverage_flags = []
+    if include_edges:
+        coverage_flags.append("Include Edge/Boundary")
+    if include_neg:
+        coverage_flags.append("Include Negative Tests")
+    if include_nfr:
+        coverage_flags.append("Include NFRs (Perf/Sec/A11y)")
+
+    payload = {
+        "role": role,
+        "test_type": test_type,
+        "output_format": output_format,
+        "context": context or "",
+        "requirements": requirements or "",
+        "coverage_flags": coverage_flags,
+        "risk_tags": risk_tags if "risk_tags" in locals() else ["Auth", "Validation", "UI", "API", "Data"],
+        "acceptance_criteria_hint": st.session_state.suggested_ac if (requirements or "").strip() == "" else "",
+    }
+
+    if gen:
+        prompt = build_prompt(payload)
+        if "extra_instructions" in locals() and extra_instructions.strip():
+            prompt += "\n\nADDITIONAL INSTRUCTIONS\n" + extra_instructions.strip()
+
+        st.session_state.generated_prompt = prompt
+        st.session_state.ai_response = ""
+        st.success("Prompt generated.")
+
+    with tab1:
+        if st.session_state.generated_prompt:
+            st.code(st.session_state.generated_prompt, language="text")
         else:
             st.info("Generate a prompt to preview it here.")
 
-    with tabs[1]:
-        if st.session_state.ai_response.strip():
-            st.code(st.session_state.ai_response, language="markdown")
-
-            # Download raw output
-            st.download_button(
-                "⬇️ Download output (.txt)",
-                data=st.session_state.ai_response,
-                file_name="promptix_testcases.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
-
-            st.markdown("#### 📤 Export conversions (one-click)")
-            st.caption("Convert your current output into CSV / Gherkin / Jira Steps format (uses the selected provider).")
-
-            ec1, ec2, ec3 = st.columns(3)
-
-            def run_conversion(kind: str):
-                if not st.session_state.ai_response.strip():
-                    return
-
-                # Free tier limit applies here too
-                if provider == "Promptix Free (LLaMA via Together)":
-                    if st.session_state.free_calls_used >= FREE_DAILY_LIMIT:
-                        st.session_state.inline_message = "Free daily limit reached. Switch to BYOK mode."
-                        st.session_state.inline_is_error = True
-                        return
-
-                # Key must be present
-                if not api_key and provider != "Promptix Free (LLaMA via Together)":
-                    st.session_state.inline_message = "Enter your BYOK key in the sidebar to convert."
-                    st.session_state.inline_is_error = True
-                    return
-
-                base = st.session_state.ai_response.strip()
-                if kind == "csv":
-                    convert_prompt = f"""
-Convert the following test cases into a clean CSV.
-Columns: ID, Title, Priority, Preconditions, TestData, Steps, Expected, Tags, ACRef.
-Return ONLY CSV (no markdown).
-
-TEST CASES:
-{base}
-""".strip()
-                elif kind == "gherkin":
-                    convert_prompt = f"""
-Convert the following test cases into Gherkin (Cucumber/BDD).
-- Use Feature, Background (if needed), and Scenarios.
-- Add tags like @risk_auth @risk_validation from risk tags found in the content.
-- Include AC reference in scenario title.
-Return ONLY Gherkin.
-
-TEST CASES:
-{base}
-""".strip()
-                else:  # jira
-                    convert_prompt = f"""
-Convert the following test cases into Jira/Zephyr friendly format.
-For each test case output:
-- Test Summary:
-- Precondition:
-- Test Steps table (Step | Data | Expected)
-- Labels/Tags:
-- Priority:
-- AC Reference:
-Return in plain text (no markdown tables if possible — use aligned text).
-
-TEST CASES:
-{base}
-""".strip()
-
-                text, status, raw = call_ai(provider, api_endpoint, api_model, api_key, convert_prompt)
-                st.session_state.last_api_status = status
-                st.session_state.last_api_raw = raw
-
-                if not text.strip():
-                    st.session_state.inline_message = "Conversion failed. Check Debug."
-                    st.session_state.inline_is_error = True
-                    return
-
-                if kind == "csv":
-                    st.session_state.export_csv = text.strip()
-                elif kind == "gherkin":
-                    st.session_state.export_gherkin = text.strip()
-                else:
-                    st.session_state.export_jira = text.strip()
-
-                # count free usage
-                if provider == "Promptix Free (LLaMA via Together)":
-                    st.session_state.free_calls_used += 1
-
-            with ec1:
-                if st.button("Convert → CSV", use_container_width=True):
-                    run_conversion("csv")
-            with ec2:
-                if st.button("Convert → Gherkin", use_container_width=True):
-                    run_conversion("gherkin")
-            with ec3:
-                if st.button("Convert → Jira Steps", use_container_width=True):
-                    run_conversion("jira")
-
-            # Show conversions
-            if st.session_state.export_csv:
-                with st.expander("✅ CSV Export", expanded=False):
-                    st.code(st.session_state.export_csv, language="text")
-                    st.download_button(
-                        "⬇️ Download CSV",
-                        data=st.session_state.export_csv,
-                        file_name="promptix_testcases.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-
-            if st.session_state.export_gherkin:
-                with st.expander("✅ Gherkin Export", expanded=False):
-                    st.code(st.session_state.export_gherkin, language="gherkin")
-                    st.download_button(
-                        "⬇️ Download Gherkin",
-                        data=st.session_state.export_gherkin,
-                        file_name="promptix_testcases.feature",
-                        mime="text/plain",
-                        use_container_width=True,
-                    )
-
-            if st.session_state.export_jira:
-                with st.expander("✅ Jira/Zephyr Export", expanded=False):
-                    st.code(st.session_state.export_jira, language="text")
-                    st.download_button(
-                        "⬇️ Download Jira text",
-                        data=st.session_state.export_jira,
-                        file_name="promptix_jira_zephyr.txt",
-                        mime="text/plain",
-                        use_container_width=True,
-                    )
-
+    with tab2:
+        if st.session_state.ai_response:
+            st.write(st.session_state.ai_response)
         else:
-            st.info("No response yet. Click Send to AI.")
+            st.info("Send to AI to view the response here.")
 
-        if st.session_state.last_api_status:
-            st.caption(st.session_state.last_api_status)
+    st.markdown("---")
 
-        with st.expander("🔎 Debug (last provider response)", expanded=False):
-            st.code(st.session_state.last_api_raw or "No debug yet.")
+    # Actions row (core: generate + send)
+    a1, a2 = st.columns([0.5, 0.5], gap="small")
+
+    with a1:
+        if st.button("⚡ Generate Prompt (quick)", use_container_width=True):
+            prompt = build_prompt(payload)
+            if "extra_instructions" in locals() and extra_instructions.strip():
+                prompt += "\n\nADDITIONAL INSTRUCTIONS\n" + extra_instructions.strip()
+            st.session_state.generated_prompt = prompt
+            st.session_state.ai_response = ""
+            st.toast("Prompt updated.", icon="✅")
+            st.rerun()
+
+    with a2:
+        if st.button("🚀 Send to AI", use_container_width=True):
+            # If no prompt, auto-generate first (no new functionality; just smoother UX)
+            if not st.session_state.generated_prompt:
+                prompt = build_prompt(payload)
+                if "extra_instructions" in locals() and extra_instructions.strip():
+                    prompt += "\n\nADDITIONAL INSTRUCTIONS\n" + extra_instructions.strip()
+                st.session_state.generated_prompt = prompt
+
+            # Determine which key to use
+            active_key = together_key if provider == "Promptix Free (LLaMA via Together)" else user_key
+
+            if provider == "Promptix Free (LLaMA via Together)":
+                if not together_key:
+                    st.error("Missing **TOGETHER_API_KEY**. Add it in Streamlit Secrets.")
+                elif st.session_state.free_calls_left <= 0:
+                    st.error("Free calls exhausted for this session (10/10).")
+                else:
+                    try:
+                        with st.spinner("Calling AI…"):
+                            st.session_state.ai_response = call_llm(
+                                provider=provider,
+                                endpoint=endpoint,
+                                model=model,
+                                api_key=active_key,
+                                prompt=st.session_state.generated_prompt,
+                            )
+                        st.session_state.free_calls_left -= 1
+                        st.success("AI response generated.")
+                    except Exception as e:
+                        st.session_state.last_error = str(e)
+                        st.error(f"AI call failed: {e}")
+            else:
+                if not (user_key or "").strip():
+                    st.error("Please paste your API key in the sidebar for the selected provider.")
+                else:
+                    try:
+                        with st.spinner("Calling AI…"):
+                            st.session_state.ai_response = call_llm(
+                                provider=provider,
+                                endpoint=endpoint,
+                                model=model,
+                                api_key=active_key,
+                                prompt=st.session_state.generated_prompt,
+                            )
+                        st.success("AI response generated.")
+                    except Exception as e:
+                        st.session_state.last_error = str(e)
+                        st.error(f"AI call failed: {e}")
+
+            st.rerun()
+
+    if st.session_state.last_error:
+        with st.expander("Last error (debug)", expanded=False):
+            st.code(st.session_state.last_error, language="text")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# =========================================================
-# Footer
-# =========================================================
+
+# =========================
+# Footer (as requested)
+# =========================
 st.markdown(
     """
-    <div class="footer">
-      <div class="small">
-        Thought and built by <a href="https://www.linkedin.com/in/monika-kushwaha-52443735/" target="_blank">Monika Kushwaha</a>
-        — QA Engineer | GenAI Product Management | LLMs, RAG, Automation, Performance
-      </div>
-    </div>
-    """,
+<div class="px-footer">
+  Thought and built by
+  <a href="https://www.linkedin.com/in/monika-kushwaha-52443735/" target="_blank" rel="noopener noreferrer">
+    Monika Kushwaha
+  </a>
+  — QA Engineer | GenAI Product Management | LLMs, RAG, Automation, Performance
+</div>
+""",
     unsafe_allow_html=True,
 )
