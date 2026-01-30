@@ -1,66 +1,13 @@
-# app.py — Promptix AI v2
-# ✅ Keep current UI + Supabase Email Login (reload-safe)
-# ✅ Restore main functionality:
-#   - Promptix Free (LLaMA via Together) = 3/day per user (PERSISTENT via Supabase table)
-#   - BYOK options: Together, OpenAI, Gemini, Anthropic
-#   - Sample data button
-#   - Testing roles, test type, test management format
-#   - Advanced prompt engineering (checkboxes: comprehensive/edge/negative etc.)
-#   - Two-step flow: Generate Advanced Prompt -> Send to AI
-#
-# -----------------------------
-# Streamlit Secrets (Streamlit Cloud → App → Settings → Secrets)
-# -----------------------------
-# SUPABASE_URL = "https://xxxx.supabase.co"
-# SUPABASE_ANON_KEY = "your_anon_key"
-# TOGETHER_API_KEY = "server key for Promptix Free (optional but required for Free mode)"
-#
-# OPTIONAL:
-# APP_TIMEZONE = "Asia/Kolkata"
-# DAILY_FREE_LIMIT = 3
-# TOGETHER_MODEL_FREE = "meta-llama/Llama-3.1-70B-Instruct-Turbo"
-# TOGETHER_MODEL_BYOK_DEFAULT = "meta-llama/Llama-3.1-70B-Instruct-Turbo"
-# OPENAI_MODEL_DEFAULT = "gpt-4o-mini"
-# GEMINI_MODEL_DEFAULT = "gemini-1.5-flash"
-# ANTHROPIC_MODEL_DEFAULT = "claude-3-5-sonnet-latest"
-#
-# -----------------------------
-# requirements.txt
-# -----------------------------
-# streamlit
-# requests
-# extra-streamlit-components
-#
-# -----------------------------
-# Supabase SQL (run once) — persistent daily usage
-# -----------------------------
-# create table if not exists public.promptix_usage (
-#   id uuid primary key default gen_random_uuid(),
-#   user_id uuid not null,
-#   usage_date date not null,
-#   count int not null default 0,
-#   updated_at timestamptz not null default now(),
-#   unique(user_id, usage_date)
-# );
-#
-# alter table public.promptix_usage enable row level security;
-#
-# create policy "Users can read own usage"
-# on public.promptix_usage for select
-# using (auth.uid() = user_id);
-#
-# create policy "Users can insert own usage"
-# on public.promptix_usage for insert
-# with check (auth.uid() = user_id);
-#
-# create policy "Users can update own usage"
-# on public.promptix_usage for update
-# using (auth.uid() = user_id)
-# with check (auth.uid() = user_id);
+# app.py — Promptix AI v2 (FULL)
+# ✅ Keeps: Current UI feel + Supabase Email Login (reload-safe)
+# ✅ Restores missing options + fixes Together model error handling + copy buttons
+# ✅ Adds: Platform dropdown, richer Test Type + Format options, API Endpoint display
+# ✅ Fix: default Together model -> Meta-Llama 3.1 8B Turbo (more commonly accessible)
 
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Optional, Tuple
 
 import requests
 import streamlit as st
@@ -73,20 +20,30 @@ st.set_page_config(page_title="Promptix AI v2", layout="wide")
 
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "").strip()
 SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "").strip()
+
+# Server key used ONLY for "Promptix Free"
 TOGETHER_API_KEY_SERVER = st.secrets.get("TOGETHER_API_KEY", "").strip()
 
 APP_TIMEZONE = st.secrets.get("APP_TIMEZONE", "Asia/Kolkata")
 DAILY_FREE_LIMIT = int(st.secrets.get("DAILY_FREE_LIMIT", 3))
 
-TOGETHER_BASE_URL = "https://api.together.xyz/v1"
-TOGETHER_MODEL_FREE = st.secrets.get("TOGETHER_MODEL_FREE", "meta-llama/Llama-3.1-70B-Instruct-Turbo")
-TOGETHER_MODEL_BYOK_DEFAULT = st.secrets.get("TOGETHER_MODEL_BYOK_DEFAULT", "meta-llama/Llama-3.1-70B-Instruct-Turbo")
+# OpenAI-compatible endpoints
+TOGETHER_BASE_URL_DEFAULT = st.secrets.get("TOGETHER_BASE_URL", "https://api.together.xyz/v1").strip()
+OPENAI_BASE_URL_DEFAULT = st.secrets.get("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
 
-OPENAI_BASE_URL = "https://api.openai.com/v1"
-OPENAI_MODEL_DEFAULT = st.secrets.get("OPENAI_MODEL_DEFAULT", "gpt-4o-mini")
+# Sensible defaults
+# NOTE: Your screenshot error indicates the 70B name wasn't accessible. 8B Turbo is safer default.
+TOGETHER_MODEL_SAFE_DEFAULT = st.secrets.get(
+    "TOGETHER_MODEL_SAFE_DEFAULT", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+).strip()
 
-GEMINI_MODEL_DEFAULT = st.secrets.get("GEMINI_MODEL_DEFAULT", "gemini-1.5-flash")
-ANTHROPIC_MODEL_DEFAULT = st.secrets.get("ANTHROPIC_MODEL_DEFAULT", "claude-3-5-sonnet-latest")
+TOGETHER_MODEL_ALT_70B = st.secrets.get(
+    "TOGETHER_MODEL_ALT_70B", "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+).strip()
+
+OPENAI_MODEL_DEFAULT = st.secrets.get("OPENAI_MODEL_DEFAULT", "gpt-4o-mini").strip()
+GEMINI_MODEL_DEFAULT = st.secrets.get("GEMINI_MODEL_DEFAULT", "gemini-1.5-flash").strip()
+ANTHROPIC_MODEL_DEFAULT = st.secrets.get("ANTHROPIC_MODEL_DEFAULT", "claude-3-5-sonnet-latest").strip()
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error("Missing SUPABASE_URL / SUPABASE_ANON_KEY in Streamlit Secrets.")
@@ -179,6 +136,11 @@ footer {visibility: hidden;}
   border: 1px solid rgba(34,197,94,0.30);
   background: rgba(34,197,94,0.12);
 }
+
+/* Improve text area look */
+textarea {
+  border-radius: 12px !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -197,7 +159,7 @@ def _safe_json(resp: requests.Response):
     except Exception:
         return None
 
-def _sb_headers(access_token: str | None = None) -> dict:
+def _sb_headers(access_token: Optional[str] = None) -> dict:
     return {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {access_token or SUPABASE_ANON_KEY}",
@@ -207,7 +169,7 @@ def _sb_headers(access_token: str | None = None) -> dict:
 # =========================================================
 # SUPABASE AUTH (NO CRASH)
 # =========================================================
-def supabase_sign_in(email: str, password: str):
+def supabase_sign_in(email: str, password: str) -> Tuple[Optional[dict], Optional[str]]:
     url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
     try:
         r = requests.post(url, headers=_sb_headers(None), json={"email": email, "password": password}, timeout=20)
@@ -219,7 +181,7 @@ def supabase_sign_in(email: str, password: str):
         return None, f"{r.status_code}: {msg or r.text.strip()}"
     return r.json(), None
 
-def supabase_sign_up(email: str, password: str):
+def supabase_sign_up(email: str, password: str) -> Tuple[Optional[dict], Optional[str]]:
     url = f"{SUPABASE_URL}/auth/v1/signup"
     try:
         r = requests.post(url, headers=_sb_headers(None), json={"email": email, "password": password}, timeout=20)
@@ -231,7 +193,7 @@ def supabase_sign_up(email: str, password: str):
         return None, f"{r.status_code}: {msg or r.text.strip()}"
     return r.json(), None
 
-def supabase_get_user(access_token: str):
+def supabase_get_user(access_token: str) -> Optional[dict]:
     url = f"{SUPABASE_URL}/auth/v1/user"
     try:
         r = requests.get(url, headers=_sb_headers(access_token), timeout=15)
@@ -241,7 +203,7 @@ def supabase_get_user(access_token: str):
         return None
     return _safe_json(r)
 
-def supabase_refresh(refresh_token: str):
+def supabase_refresh(refresh_token: str) -> Tuple[Optional[dict], Optional[str]]:
     url = f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token"
     try:
         r = requests.post(url, headers=_sb_headers(None), json={"refresh_token": refresh_token}, timeout=20)
@@ -326,7 +288,7 @@ def do_logout():
     st.rerun()
 
 # =========================================================
-# SUPABASE USAGE (PERSISTENT) — used for Promptix Free only
+# SUPABASE USAGE (PERSISTENT) — Promptix Free only
 # =========================================================
 def get_daily_usage(user_id: str, access_token: str, usage_date: str) -> int:
     url = f"{SUPABASE_URL}/rest/v1/promptix_usage?user_id=eq.{user_id}&usage_date=eq.{usage_date}&select=count"
@@ -364,6 +326,39 @@ def increment_daily_usage(user_id: str, access_token: str, usage_date: str) -> i
     return new_count if ok else current
 
 # =========================================================
+# TOGETHER MODEL HELPERS (for the "Unable to access model" error)
+# =========================================================
+TOGETHER_SUGGESTED_MODELS = [
+    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "meta-llama/Meta-Llama-3-8B-Instruct-Turbo",
+    "meta-llama/Meta-Llama-3-70B-Instruct-Turbo",
+]
+
+def together_list_models(api_key: str) -> Optional[set]:
+    """Best-effort model list (no hard failure if it can't fetch)."""
+    if not api_key:
+        return None
+    try:
+        r = requests.get(
+            TOGETHER_BASE_URL_DEFAULT.rstrip("/") + "/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        data = j.get("data", [])
+        names = set()
+        for m in data:
+            if isinstance(m, dict) and m.get("id"):
+                names.add(m["id"])
+        return names or None
+    except Exception:
+        return None
+
+# =========================================================
 # LLM CALLS
 # =========================================================
 def call_openai_compatible(base_url: str, api_key: str, model: str, prompt: str) -> str:
@@ -380,7 +375,9 @@ def call_openai_compatible(base_url: str, api_key: str, model: str, prompt: str)
     r = requests.post(url, headers=headers, json=payload, timeout=90)
     if r.status_code != 200:
         j = _safe_json(r)
-        msg = j.get("error", {}).get("message") if isinstance(j, dict) else None
+        msg = None
+        if isinstance(j, dict):
+            msg = (j.get("error") or {}).get("message") or j.get("message")
         raise RuntimeError(msg or r.text)
     j = r.json()
     return j["choices"][0]["message"]["content"].strip()
@@ -428,7 +425,7 @@ def call_anthropic(api_key: str, model: str, prompt: str) -> str:
     return content[0].get("text", "").strip()
 
 # =========================================================
-# PROMPT ENGINEERING (RESTORED)
+# PROMPT ENGINEERING (RESTORED + EXPANDED OPTIONS)
 # =========================================================
 TESTING_ROLES = [
     "QA Tester — Manual testing expert",
@@ -443,32 +440,42 @@ TESTING_ROLES = [
     "Accessibility QA — WCAG basics",
 ]
 
+# This "Test Type" dropdown is the classic QA type (functional/smoke/etc.)
 TEST_TYPES = [
     "Functional Testing",
-    "Regression Testing",
     "Smoke Testing",
     "Sanity Testing",
+    "Regression Testing",
     "UI Testing",
     "API Testing",
     "Integration Testing",
     "End-to-End (E2E) Testing",
+    "Accessibility Testing",
+    "Security Testing (basic)",
+    "Performance Testing (basic)",
 ]
 
+PLATFORMS = ["Web", "Mobile", "API", "Web + API", "Mobile + API"]
+
+# Match your screenshot style (Jira/Zephyr, Excel/CSV, Custom)
 TEST_MGMT_FORMATS = [
     "Standard/Detailed — Comprehensive format",
-    "Jira/Xray — Import-friendly",
-    "TestRail — Import-friendly",
-    "BDD (Gherkin) — Feature/Scenario format",
-    "CSV — Spreadsheet-ready",
+    "Jira/Zephyr — Atlassian import style",
+    "TestRail — TestRail format",
+    "Cucumber/BDD — Gherkin syntax",
+    "Excel/CSV — Generic import format",
+    "Custom — I will define",
 ]
 
 def fill_sample_data():
+    st.session_state.px_platform = "Web"
     st.session_state.px_context = "zepto.com — user added a new address"
     st.session_state.px_requirements = "User logs in with valid credentials, adds a new address, and sees it saved correctly."
     st.session_state.px_additional = "Consider invalid address fields, network timeouts, duplicates, and location pin issues."
     st.session_state.px_role = TESTING_ROLES[0]
     st.session_state.px_test_type = "Functional Testing"
     st.session_state.px_format = TEST_MGMT_FORMATS[0]
+    st.session_state.px_custom_format_notes = ""
     st.session_state.px_cases = 20
     st.session_state.px_id_prefix = "TC"
     st.session_state.px_priority = "P0/P1/P2"
@@ -486,6 +493,7 @@ def build_advanced_prompt(cfg: dict) -> str:
     role = cfg["role"]
     test_type = cfg["test_type"]
     fmt = cfg["format"]
+    platform = cfg.get("platform", "Web")
     context = cfg["context"].strip()
     req = cfg["requirements"].strip()
     add = cfg["additional"].strip()
@@ -493,6 +501,7 @@ def build_advanced_prompt(cfg: dict) -> str:
     n_cases = cfg["n_cases"]
     id_prefix = cfg["id_prefix"].strip() or "TC"
     priority_scheme = cfg["priority_scheme"]
+    custom_notes = (cfg.get("custom_format_notes") or "").strip()
 
     flags = []
     if cfg["include_comprehensive"]: flags.append("Comprehensive coverage")
@@ -501,41 +510,55 @@ def build_advanced_prompt(cfg: dict) -> str:
     if cfg["include_boundary"]: flags.append("Boundary/validation tests")
     if cfg["include_ui"]: flags.append("UI validations")
     if cfg["include_api"]: flags.append("API validations")
-    if cfg["include_accessibility"]: flags.append("Accessibility basics")
-    if cfg["include_security"]: flags.append("Security (OWASP basics)")
-    if cfg["include_performance"]: flags.append("Performance (basic)")
-
+    if cfg["include_accessibility"]: flags.append("Accessibility basics (WCAG)")
+    if cfg["include_security"]: flags.append("Security basics (OWASP)")
+    if cfg["include_performance"]: flags.append("Performance basics (latency/throughput)")
     focus = ", ".join(flags) if flags else "Functional coverage"
 
-    output_instructions = ""
-    if fmt.startswith("BDD"):
+    # Output instructions by format
+    if fmt.startswith("Cucumber/BDD"):
         output_instructions = (
             "Output strictly in BDD Gherkin:\n"
             "- Provide a Feature title\n"
             "- Write 8–15 Scenarios with Given/When/Then\n"
             "- Include tags like @smoke @regression @negative where relevant\n"
         )
-    elif fmt.startswith("CSV"):
+    elif fmt.startswith("Excel/CSV"):
         output_instructions = (
             "Output as CSV in plain text (comma-separated) with header:\n"
             "TestCaseID,Title,Preconditions,Steps,ExpectedResult,Priority,Type\n"
         )
+    elif fmt.startswith("Jira/Zephyr"):
+        output_instructions = (
+            "Output as a Markdown table with columns:\n"
+            "Test Case ID | Title | Preconditions | Steps | Expected Result | Priority | Type\n"
+            "Make titles concise and import-friendly for Jira/Zephyr. Keep steps structured.\n"
+        )
+    elif fmt.startswith("TestRail"):
+        output_instructions = (
+            "Output as a Markdown table with columns:\n"
+            "Test Case ID | Title | Preconditions | Steps | Expected Result | Priority | Type\n"
+            "Make steps explicit and structured for TestRail.\n"
+        )
+    elif fmt.startswith("Custom"):
+        output_instructions = (
+            "Output in the custom format described below. If anything is unclear, pick the closest reasonable structure.\n"
+            f"CUSTOM FORMAT NOTES:\n{custom_notes if custom_notes else '(No custom notes provided — use a clean detailed table format.)'}\n"
+        )
     else:
-        # Standard / Jira / TestRail => markdown table is best for demo; import-friendly wording
         output_instructions = (
             "Output as a Markdown table with columns:\n"
             "Test Case ID | Title | Preconditions | Steps | Expected Result | Priority | Type\n"
         )
-        if fmt.startswith("Jira"):
-            output_instructions += "Make titles concise and import-friendly for Jira/Xray.\n"
-        if fmt.startswith("TestRail"):
-            output_instructions += "Make steps explicit and structured for TestRail.\n"
 
     prompt = f"""
 You are acting as: {role}
 
 TASK:
 Create {n_cases} high-quality QA test cases for: {test_type}
+
+PLATFORM / SURFACE:
+{platform}
 
 CONTEXT (What are we testing?):
 {context}
@@ -551,8 +574,9 @@ COVERAGE FOCUS:
 
 QUALITY BAR:
 - Mix functional + negative + edge/boundary where applicable
-- Include data validations, error messaging, state handling, and idempotency where relevant
-- Clearly mention assumptions where needed (e.g., logged-in user, permissions)
+- Include validations, error messaging, state handling, and idempotency where relevant
+- Avoid hallucinating features that are not implied by the requirements
+- Clearly state assumptions only when necessary
 
 PRIORITY:
 Use {priority_scheme}
@@ -565,10 +589,48 @@ OUTPUT FORMAT (STRICT):
 
 IMPORTANT:
 - Do not include any real secrets or private data.
-- Do not invent product features not implied by requirements.
+- Keep results demo-friendly and export-ready.
 """.strip()
 
     return prompt
+
+# =========================================================
+# CLIPBOARD (Copy buttons) — JS component
+# =========================================================
+def clipboard_button(label: str, text_to_copy: str, button_id: str):
+    # Use a small HTML/JS snippet for copy-to-clipboard
+    safe_text = (text_to_copy or "").replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    html = f"""
+    <div style="margin: 6px 0 10px 0;">
+      <button id="{button_id}"
+        style="
+          padding:10px 14px;
+          border-radius:12px;
+          border:1px solid rgba(255,255,255,0.14);
+          background: rgba(255,255,255,0.06);
+          color: rgba(255,255,255,0.90);
+          cursor:pointer;
+          width: 100%;
+        "
+      >{label}</button>
+      <script>
+        const btn = document.getElementById("{button_id}");
+        if(btn) {{
+          btn.onclick = async () => {{
+            try {{
+              await navigator.clipboard.writeText(`{safe_text}`);
+              btn.innerText = "✅ Copied!";
+              setTimeout(()=>btn.innerText="{label}", 1400);
+            }} catch (e) {{
+              btn.innerText = "❌ Copy failed";
+              setTimeout(()=>btn.innerText="{label}", 1400);
+            }}
+          }};
+        }}
+      </script>
+    </div>
+    """
+    st.components.v1.html(html, height=60)
 
 # =========================================================
 # LOGIN UI (KEEP)
@@ -655,18 +717,33 @@ PROVIDERS = [
     "Anthropic Claude (BYOK)",
 ]
 
-def render_sidebar(user, usage_date: str, used_free: int, remaining_free: int):
+def render_sidebar(user, used_free: int, remaining_free: int):
     st.sidebar.markdown("## 🔐 AI Settings")
-
     provider = st.sidebar.selectbox("Provider", PROVIDERS, index=0, key="px_provider")
 
-    # Provider-specific inputs (BYOK)
     cfg = {"provider": provider}
+
+    # Common: show endpoint where relevant (as per your older UI)
+    if provider in ("Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)"):
+        endpoint = st.sidebar.text_input("API Endpoint", value=TOGETHER_BASE_URL_DEFAULT, key="px_together_endpoint")
+        cfg["base_url"] = endpoint.strip()
+
+        # model: provide select + custom
+        model_choice = st.sidebar.selectbox(
+            "Model (Together)",
+            options=["(Recommended) " + TOGETHER_MODEL_SAFE_DEFAULT, "(Try) " + TOGETHER_MODEL_ALT_70B, "Custom…"],
+            index=0,
+            key="px_together_model_choice",
+        )
+        if model_choice == "Custom…":
+            model = st.sidebar.text_input("Custom model id", value=TOGETHER_MODEL_SAFE_DEFAULT, key="px_together_model_custom")
+        else:
+            model = model_choice.replace("(Recommended) ", "").replace("(Try) ", "").strip()
+        cfg["model"] = model
 
     if provider == "Promptix Free (LLaMA via Together)":
         cfg["api_key"] = TOGETHER_API_KEY_SERVER
-        cfg["base_url"] = TOGETHER_BASE_URL
-        cfg["model"] = st.sidebar.text_input("Model", value=TOGETHER_MODEL_FREE, key="px_free_model")
+
         st.sidebar.markdown(
             f"""
 <div class="kpi-box">
@@ -687,15 +764,13 @@ TOGETHER_API_KEY
                 unsafe_allow_html=True,
             )
         else:
-            st.sidebar.warning("TOGETHER_API_KEY is missing in Streamlit Secrets. Free mode won't work.")
+            st.sidebar.warning("TOGETHER_API_KEY is missing in Secrets. Free mode won't work.")
 
     elif provider == "Together LLaMA (BYOK)":
-        cfg["base_url"] = TOGETHER_BASE_URL
-        cfg["model"] = st.sidebar.text_input("Model", value=TOGETHER_MODEL_BYOK_DEFAULT, key="px_together_model")
         cfg["api_key"] = st.sidebar.text_input("Together API Key", type="password", placeholder="Paste your key", key="px_together_key")
 
     elif provider == "OpenAI (BYOK)":
-        cfg["base_url"] = st.sidebar.text_input("Base URL", value=OPENAI_BASE_URL, key="px_openai_base")
+        cfg["base_url"] = st.sidebar.text_input("API Endpoint", value=OPENAI_BASE_URL_DEFAULT, key="px_openai_base").strip()
         cfg["model"] = st.sidebar.text_input("Model", value=OPENAI_MODEL_DEFAULT, key="px_openai_model")
         cfg["api_key"] = st.sidebar.text_input("OpenAI API Key", type="password", placeholder="Paste your key", key="px_openai_key")
 
@@ -724,7 +799,8 @@ TOGETHER_API_KEY
     )
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown(f"**Logged in:** {user.get('email','')}")
+    st.sidebar.markdown("**Logged in:**")
+    st.sidebar.markdown(user.get("email", ""))
     if st.sidebar.button("Logout", use_container_width=True):
         do_logout()
 
@@ -735,33 +811,32 @@ def send_to_ai(prompt: str) -> str:
     if provider in ("Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)", "OpenAI (BYOK)"):
         if not cfg.get("api_key"):
             raise RuntimeError("Missing API key.")
-        return call_openai_compatible(cfg["base_url"], cfg["api_key"], cfg["model"], prompt)
+        return call_openai_compatible(cfg.get("base_url") or OPENAI_BASE_URL_DEFAULT, cfg["api_key"], cfg.get("model") or OPENAI_MODEL_DEFAULT, prompt)
 
     if provider == "Google Gemini (BYOK)":
         if not cfg.get("api_key"):
             raise RuntimeError("Missing Gemini API key.")
-        return call_gemini(cfg["api_key"], cfg["model"], prompt)
+        return call_gemini(cfg["api_key"], cfg.get("model") or GEMINI_MODEL_DEFAULT, prompt)
 
     if provider == "Anthropic Claude (BYOK)":
         if not cfg.get("api_key"):
             raise RuntimeError("Missing Anthropic API key.")
-        return call_anthropic(cfg["api_key"], cfg["model"], prompt)
+        return call_anthropic(cfg["api_key"], cfg.get("model") or ANTHROPIC_MODEL_DEFAULT, prompt)
 
     raise RuntimeError("Invalid provider.")
 
 # =========================================================
-# MAIN APP (RESTORED UI + FEATURES)
+# MAIN APP
 # =========================================================
 def render_main_app():
     user = st.session_state.user
     access_token = st.session_state.access_token
     usage_date = today_local_iso()
 
-    # free usage only matters for Promptix Free
     used_free = get_daily_usage(user["id"], access_token, usage_date)
     remaining_free = max(0, DAILY_FREE_LIMIT - used_free)
 
-    render_sidebar(user, usage_date, used_free, remaining_free)
+    render_sidebar(user, used_free, remaining_free)
 
     # HERO
     st.markdown(
@@ -771,25 +846,36 @@ def render_main_app():
     Promptix AI v2 <span class="badge">MVP</span>
   </div>
   <div class="subtle">
-    Turn product requirements into structured, export-ready test cases — with edge cases, negatives, and multiple formats (Jira/TestRail/BDD/CSV).
+    Turn product requirements into structured, export-ready test cases — with edge cases, negatives, and multiple formats (Jira/Zephyr/TestRail/BDD/CSV).
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
-
     st.write("")
+
+    # Header strip (like your earlier KPI row)
+    col1, col2, col3 = st.columns([2.4, 1, 1])
+    with col1:
+        st.info(f"👤 Logged in as **{user.get('email','')}**")
+    with col2:
+        st.metric("Daily free limit", f"{DAILY_FREE_LIMIT}/day")
+    with col3:
+        st.metric("Remaining today", str(remaining_free))
+
     st.markdown("## 🧪 Test Configuration")
 
-    col_btn, col_spacer = st.columns([1, 3])
-    with col_btn:
-        if st.button("🎯 Fill Sample Data", use_container_width=True):
-            fill_sample_data()
+    # Sample data button
+    if st.button("🎯 Fill Sample Data", use_container_width=True):
+        fill_sample_data()
 
-    # Defaults (only set once)
+    # Defaults
+    st.session_state.setdefault("px_platform", "Web")
     st.session_state.setdefault("px_role", TESTING_ROLES[0])
     st.session_state.setdefault("px_test_type", TEST_TYPES[0])
     st.session_state.setdefault("px_format", TEST_MGMT_FORMATS[0])
+    st.session_state.setdefault("px_custom_format_notes", "")
+
     st.session_state.setdefault("px_context", "")
     st.session_state.setdefault("px_requirements", "")
     st.session_state.setdefault("px_additional", "")
@@ -813,9 +899,14 @@ def render_main_app():
     st.selectbox("Test Type", TEST_TYPES, key="px_test_type")
     st.selectbox("Test Management Format (Import-Ready)", TEST_MGMT_FORMATS, key="px_format")
 
-    st.text_area("Context (What are you testing?)", key="px_context", height=110, max_chars=4000)
-    st.text_area("Requirements (What should it do?)", key="px_requirements", height=130, max_chars=4000)
-    st.text_area("Additional Information", key="px_additional", height=110, max_chars=4000)
+    if str(st.session_state.px_format).startswith("Custom"):
+        st.text_area("Custom format notes (optional)", key="px_custom_format_notes", height=90, max_chars=2000)
+
+    st.selectbox("Platform", PLATFORMS, key="px_platform")
+
+    st.text_area("Context (What are you testing?)", key="px_context", height=120, max_chars=4000)
+    st.text_area("Requirements (What should it do?)", key="px_requirements", height=140, max_chars=4000)
+    st.text_area("Additional Information", key="px_additional", height=120, max_chars=4000)
 
     st.markdown(
         """
@@ -831,7 +922,7 @@ def render_main_app():
         unsafe_allow_html=True,
     )
 
-    # Checkboxes (restored)
+    # Checkboxes
     st.write("")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -847,7 +938,7 @@ def render_main_app():
         st.checkbox("🛡️ Security (basic)", key="px_include_security")
         st.checkbox("⚡ Performance (basic)", key="px_include_performance")
 
-    # Advanced Prompt Engineering (restored)
+    # Advanced Prompt Engineering
     st.write("")
     with st.expander("⚡ Advanced Prompt Engineering", expanded=True):
         st.slider("Number of test cases", min_value=8, max_value=40, value=int(st.session_state.px_cases), key="px_cases")
@@ -857,6 +948,7 @@ def render_main_app():
     st.write("")
     colA, colB = st.columns([1, 1])
 
+    # Generate prompt
     with colA:
         if st.button("⚡ Generate Advanced Prompt", use_container_width=True):
             if not st.session_state.px_context.strip() or not st.session_state.px_requirements.strip():
@@ -866,6 +958,8 @@ def render_main_app():
                     "role": st.session_state.px_role,
                     "test_type": st.session_state.px_test_type,
                     "format": st.session_state.px_format,
+                    "custom_format_notes": st.session_state.get("px_custom_format_notes", ""),
+                    "platform": st.session_state.px_platform,
                     "context": st.session_state.px_context,
                     "requirements": st.session_state.px_requirements,
                     "additional": st.session_state.px_additional,
@@ -885,13 +979,14 @@ def render_main_app():
                 st.session_state.advanced_prompt = build_advanced_prompt(prompt_cfg)
                 st.success("Advanced prompt generated ✅")
 
+    # Send to AI
     with colB:
         can_send = bool(st.session_state.get("advanced_prompt"))
         if st.button("🚀 Send to AI", use_container_width=True, disabled=not can_send):
             cfg = st.session_state.get("llm_cfg") or {}
             provider = cfg.get("provider")
 
-            # Enforce free limit ONLY for Promptix Free
+            # Enforce free limit only for Promptix Free
             if provider == "Promptix Free (LLaMA via Together)":
                 if remaining_free <= 0:
                     st.error("Daily free limit reached. Please come back tomorrow or use BYOK.")
@@ -900,16 +995,42 @@ def render_main_app():
                     st.error("TOGETHER_API_KEY is missing in Secrets. Free mode can't run.")
                     return
 
-            # BYOK key validation
+            # BYOK key required
             if provider != "Promptix Free (LLaMA via Together)" and not cfg.get("api_key"):
                 st.error("Please add your API key in the sidebar.")
                 return
+
+            # Best-effort model check for Together to reduce the error you saw
+            if provider in ("Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)"):
+                key_for_check = cfg.get("api_key") or ""
+                model_set = together_list_models(key_for_check) if key_for_check else None
+                chosen_model = cfg.get("model") or ""
+                if model_set is not None and chosen_model and chosen_model not in model_set:
+                    st.warning(
+                        f"Selected model may not be available for this key. "
+                        f"Try '{TOGETHER_MODEL_SAFE_DEFAULT}' or pick from Together models."
+                    )
 
             with st.spinner("Sending to AI…"):
                 try:
                     output = send_to_ai(st.session_state.advanced_prompt)
                 except Exception as e:
-                    st.error(f"AI request failed: {e}")
+                    msg = str(e)
+
+                    # Auto-fix the common Together model error you showed
+                    if "Unable to access model" in msg and "together" in (cfg.get("base_url") or "").lower():
+                        st.error(msg)
+                        st.info(
+                            "Fix: your Together key can't access this model. "
+                            f"Switching to safer default: {TOGETHER_MODEL_SAFE_DEFAULT}"
+                        )
+                        # force safer model for Together
+                        if provider in ("Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)"):
+                            st.session_state["px_together_model_choice"] = "(Recommended) " + TOGETHER_MODEL_SAFE_DEFAULT
+                            st.session_state.llm_cfg["model"] = TOGETHER_MODEL_SAFE_DEFAULT
+                        return
+
+                    st.error(f"AI request failed: {msg}")
                     return
 
             # Count usage after success (free only)
@@ -922,28 +1043,39 @@ def render_main_app():
 
             st.session_state.last_output = output
 
-    # Prompt editor + output (restored)
+    # PROMPT (Bigger box) + Copy
     st.write("")
     st.subheader("🧾 Advanced Prompt (Editable)")
+
     st.text_area(
         label="You can edit the prompt before sending",
         key="advanced_prompt",
-        height=260,
+        height=420,  # bigger (your complaint)
         placeholder="Click 'Generate Advanced Prompt' to create one…",
     )
 
+    if st.session_state.get("advanced_prompt"):
+        clipboard_button("📋 Copy Advanced Prompt", st.session_state.get("advanced_prompt", ""), "copy_prompt_btn")
+
+    # OUTPUT + Copy answer (restored) + Download
     if st.session_state.get("last_output"):
         st.write("")
         st.subheader("✅ AI Response")
+
+        # show output (markdown) + also provide raw text for copy
         st.markdown(st.session_state.last_output)
 
-        st.download_button(
-            "Download Output",
-            data=st.session_state.last_output.encode("utf-8"),
-            file_name=f"promptix_output_{usage_date}.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
+        cdl1, cdl2 = st.columns([1, 1])
+        with cdl1:
+            clipboard_button("📋 Copy AI Response", st.session_state.get("last_output", ""), "copy_output_btn")
+        with cdl2:
+            st.download_button(
+                "⬇️ Download Output (.md)",
+                data=st.session_state.last_output.encode("utf-8"),
+                file_name=f"promptix_output_{usage_date}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
 
     render_footer()
 
