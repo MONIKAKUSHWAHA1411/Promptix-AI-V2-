@@ -2,19 +2,31 @@ import os
 import re
 import json
 import textwrap
+import uuid
+import hmac
+import hashlib
+import base64
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
 import requests
 import streamlit as st
+import extra_streamlit_components as stx
 
-# ---------------------------
-# Page config
-# ---------------------------
+# =========================
+# CONFIG
+# =========================
+FREE_DAILY_LIMIT = 3
+COOKIE_UID = "px_uid"
+COOKIE_QUOTA = "px_quota"
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
 st.set_page_config(page_title="Promptix AI v2", layout="wide", initial_sidebar_state="expanded")
 
-# ---------------------------
+# =========================
 # UI skin (CSS only)
-# ---------------------------
+# =========================
 st.markdown(
     """
 <style>
@@ -68,28 +80,63 @@ div[data-testid="stCodeBlock"]{ border-radius: 14px !important; }
     unsafe_allow_html=True,
 )
 
-# ---------------------------
-# Session state
-# ---------------------------
-def init_state():
-    defaults = dict(
-        generated_prompt="",
-        ai_response="",
-        free_calls_left=10,
-        last_error="",
-        quality_score=0,
-        quality_gaps=[],
-        suggested_ac="",
+# =========================
+# Helpers
+# =========================
+def get_secret(name: str) -> str:
+    if name in st.secrets:
+        return str(st.secrets.get(name, "")).strip()
+    return os.getenv(name, "").strip()
+
+def today_ist() -> str:
+    return datetime.now(IST).date().isoformat()
+
+def _b64e(s: str) -> str:
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode("utf-8").rstrip("=")
+
+def _b64d(s: str) -> str:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("utf-8")).decode("utf-8")
+
+def signing_key() -> str:
+    # Best: set PROMPTIX_SIGNING_KEY in secrets.
+    # Fallback: use Together key (ok for demo).
+    return (
+        get_secret("PROMPTIX_SIGNING_KEY")
+        or get_secret("TOGETHER_API_KEY")
+        or "promptix-demo-signing-key"
     )
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
 
-init_state()
+def sign(payload_b64: str, uid: str) -> str:
+    msg = f"{uid}|{payload_b64}".encode("utf-8")
+    return hmac.new(signing_key().encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
-# ---------------------------
-# Provider config
-# ---------------------------
+def encode_quota(uid: str, day: str, remaining: int) -> str:
+    payload = json.dumps({"d": day, "r": remaining}, separators=(",", ":"))
+    payload_b64 = _b64e(payload)
+    sig = sign(payload_b64, uid)
+    return f"{payload_b64}.{sig}"
+
+def decode_quota(token: str, uid: str) -> Tuple[str, int]:
+    # returns (day, remaining) or raises
+    if not token or "." not in token:
+        raise ValueError("bad token")
+    payload_b64, sig = token.split(".", 1)
+    expected = sign(payload_b64, uid)
+    if not hmac.compare_digest(sig, expected):
+        raise ValueError("bad signature")
+    payload = json.loads(_b64d(payload_b64))
+    return payload["d"], int(payload["r"])
+
+def _post_json(url: str, headers: Dict, body: Dict) -> Dict:
+    r = requests.post(url, headers=headers, json=body, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code} {r.reason}: {r.text[:2000]}")
+    return r.json()
+
+# =========================
+# LLM providers
+# =========================
 PROVIDERS = [
     "Promptix Free (LLaMA via Together)",
     "User: Together",
@@ -105,11 +152,6 @@ API_KEY_LINKS = {
     "Together": "https://api.together.xyz/settings/api-keys",
 }
 
-def get_secret(name: str) -> str:
-    if name in st.secrets:
-        return str(st.secrets.get(name, "")).strip()
-    return os.getenv(name, "").strip()
-
 def provider_defaults(provider: str) -> Tuple[str, str]:
     if provider in ("Promptix Free (LLaMA via Together)", "User: Together"):
         return "https://api.together.xyz/v1/chat/completions", "meta-llama/Meta-Llama-3.1-8B-Instruct"
@@ -121,9 +163,178 @@ def provider_defaults(provider: str) -> Tuple[str, str]:
         return "https://generativelanguage.googleapis.com/v1beta/models", "gemini-1.5-flash"
     return "", ""
 
-# ---------------------------
+def call_together(endpoint: str, model: str, api_key: str, prompt: str) -> str:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 1400,
+    }
+    data = _post_json(endpoint, headers, body)
+    return data["choices"][0]["message"]["content"]
+
+def call_openai(endpoint: str, model: str, api_key: str, prompt: str) -> str:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 1400,
+    }
+    data = _post_json(endpoint, headers, body)
+    return data["choices"][0]["message"]["content"]
+
+def call_anthropic(endpoint: str, model: str, api_key: str, prompt: str) -> str:
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": model,
+        "max_tokens": 1400,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    data = _post_json(endpoint, headers, body)
+    return "".join([c.get("text", "") for c in data.get("content", [])]).strip()
+
+def call_gemini(base_url: str, model: str, api_key: str, prompt: str) -> str:
+    url = f"{base_url}/{model}:generateContent?key={api_key}"
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    r = requests.post(url, json=body, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code} {r.reason}: {r.text[:2000]}")
+    data = r.json()
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return json.dumps(data, indent=2)
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join([p.get("text", "") for p in parts]).strip()
+
+def call_llm(provider: str, endpoint: str, model: str, api_key: str, prompt: str) -> str:
+    if provider in ("Promptix Free (LLaMA via Together)", "User: Together"):
+        return call_together(endpoint, model, api_key, prompt)
+    if provider == "User: OpenAI":
+        return call_openai(endpoint, model, api_key, prompt)
+    if provider == "User: Anthropic":
+        return call_anthropic(endpoint, model, api_key, prompt)
+    if provider == "User: Gemini":
+        return call_gemini(endpoint, model, api_key, prompt)
+    raise ValueError("Unsupported provider")
+
+# =========================
+# Cookie-based FREE quota
+# =========================
+cookie_manager = stx.CookieManager()
+cookies = cookie_manager.get_all() or {}
+
+# stable browser uid
+uid = cookies.get(COOKIE_UID, "").strip()
+if not uid:
+    uid = str(uuid.uuid4())
+    # keep uid for ~60 days
+    cookie_manager.set(COOKIE_UID, uid, expires_at=datetime.now(timezone.utc) + timedelta(days=60))
+
+# load quota
+day = today_ist()
+remaining = FREE_DAILY_LIMIT
+
+token = cookies.get(COOKIE_QUOTA, "").strip()
+if token:
+    try:
+        token_day, token_remaining = decode_quota(token, uid)
+        if token_day == day:
+            remaining = max(0, int(token_remaining))
+        else:
+            remaining = FREE_DAILY_LIMIT
+    except Exception:
+        remaining = FREE_DAILY_LIMIT
+
+# ensure cookie exists for today
+cookie_manager.set(
+    COOKIE_QUOTA,
+    encode_quota(uid, day, remaining),
+    expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+)
+
+def spend_free_call() -> int:
+    """Decrement remaining and persist to cookie. Returns new remaining."""
+    global remaining
+    remaining = max(0, remaining - 1)
+    cookie_manager.set(
+        COOKIE_QUOTA,
+        encode_quota(uid, today_ist(), remaining),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+    )
+    return remaining
+
+# =========================
+# Session state
+# =========================
+if "generated_prompt" not in st.session_state:
+    st.session_state.generated_prompt = ""
+if "ai_response" not in st.session_state:
+    st.session_state.ai_response = ""
+if "last_error" not in st.session_state:
+    st.session_state.last_error = ""
+
+# =========================
+# Sidebar — AI Settings
+# =========================
+st.sidebar.markdown("## 🧠 AI Settings")
+provider = st.sidebar.selectbox("Provider", PROVIDERS, index=0, key="px_provider")
+
+default_endpoint, default_model = provider_defaults(provider)
+endpoint = st.sidebar.text_input("API Endpoint", value=default_endpoint, key="px_endpoint")
+model = st.sidebar.text_input("Model", value=default_model, key="px_model")
+
+together_key = (
+    get_secret("TOGETHER_API_KEY")
+    or get_secret("TOGETHER_KEY")
+    or get_secret("TOGETHER_API_TOKEN")
+).strip()
+
+user_key = ""
+if provider == "Promptix Free (LLaMA via Together)":
+    st.sidebar.markdown("🔒 **Using server key from env/secrets** (`TOGETHER_API_KEY`).")
+    st.sidebar.info(f"Free calls left today (this browser): **{remaining}/{FREE_DAILY_LIMIT}**")
+    st.sidebar.caption("Resets daily. Clearing cookies/incognito will reset (no-login limitation).")
+    if not together_key:
+        st.sidebar.error("Missing key: **TOGETHER_API_KEY** (add it in Streamlit Secrets).")
+else:
+    user_key = st.sidebar.text_input("Your API Key", type="password", key="px_user_key")
+    st.sidebar.caption("Tip: Keep keys private — don’t paste real client data into prompts.")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("🔗 **Get your API key**")
+st.sidebar.markdown(f"- OpenAI: {API_KEY_LINKS['OpenAI']}")
+st.sidebar.markdown(f"- Gemini: {API_KEY_LINKS['Gemini']}")
+st.sidebar.markdown(f"- Anthropic: {API_KEY_LINKS['Anthropic']}")
+st.sidebar.markdown(f"- Together: {API_KEY_LINKS['Together']}")
+
+# =========================
+# Header / Hero
+# =========================
+st.markdown(
+    """
+<div class="px-hero">
+  <h1 class="px-title">Promptix AI v2 <span class="px-chip">MVP</span></h1>
+  <div class="px-sub">Turn product requirements into structured, export-ready test cases — with edge cases, negatives, traceability (AC mapping), and risk tagging.</div>
+  <div class="px-stepper">
+    <span class="px-step">1) Scenario Builder</span>
+    <span class="px-step">2) Coverage Scoreboard</span>
+    <span class="px-step">3) Prompt → AI</span>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+# =========================
 # Quality scoring (heuristic)
-# ---------------------------
+# =========================
 NFR_KEYWORDS = [
     "performance", "latency", "throughput", "reliability", "availability", "security",
     "privacy", "accessibility", "a11y", "usability", "scalability", "logging", "monitoring",
@@ -195,9 +406,9 @@ def compute_quality(context: str, requirements: str, include_negatives: bool) ->
 
     return score, gaps[:6], suggested_ac
 
-# ---------------------------
+# =========================
 # Prompt generation
-# ---------------------------
+# =========================
 def build_prompt(payload: Dict) -> str:
     role = payload["role"]
     test_type = payload["test_type"]
@@ -209,10 +420,6 @@ def build_prompt(payload: Dict) -> str:
     risk_tags = payload["risk_tags"]
     ac_text = payload.get("acceptance_criteria_hint", "").strip()
 
-    ac_section = ""
-    if ac_text:
-        ac_section = f"\nSUGGESTED AC TEMPLATE (if needed):\n{ac_text}\n"
-
     output_rules = [
         "Return detailed test cases with: Test Case ID, Title, Priority, Preconditions, Steps, Test Data, Expected Result.",
         "Every test case MUST include: AC reference (AC-#) and 1–3 risk tags from the provided list.",
@@ -221,9 +428,12 @@ def build_prompt(payload: Dict) -> str:
     ]
     if "Include Negative Tests" in flags:
         output_rules.insert(2, "Include negative tests and invalid inputs (missing/invalid fields, permissions, API failures).")
-
     if "Include NFRs (Perf/Sec/A11y)" in flags:
         output_rules.append("Add a small NFR section: performance, reliability, security, accessibility checks (as applicable).")
+
+    ac_section = ""
+    if ac_text:
+        ac_section = f"\nSUGGESTED AC TEMPLATE (if needed):\n{ac_text}\n"
 
     prompt = f"""
 You are Promptix AI v2 — a senior QA engineer + test architect.
@@ -254,134 +464,9 @@ NOW GENERATE THE TEST CASES.
 
     return prompt
 
-# ---------------------------
-# HTTP helpers
-# ---------------------------
-def _post_json(url: str, headers: Dict, body: Dict) -> Dict:
-    r = requests.post(url, headers=headers, json=body, timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"{r.status_code} {r.reason}: {r.text[:2000]}")
-    return r.json()
-
-# ---------------------------
-# LLM Calls
-# ---------------------------
-def call_together(endpoint: str, model: str, api_key: str, prompt: str) -> str:
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 1400,
-    }
-    data = _post_json(endpoint, headers, body)
-    return data["choices"][0]["message"]["content"]
-
-def call_openai(endpoint: str, model: str, api_key: str, prompt: str) -> str:
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 1400,
-    }
-    data = _post_json(endpoint, headers, body)
-    return data["choices"][0]["message"]["content"]
-
-def call_anthropic(endpoint: str, model: str, api_key: str, prompt: str) -> str:
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    body = {
-        "model": model,
-        "max_tokens": 1400,
-        "temperature": 0.2,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    data = _post_json(endpoint, headers, body)
-    return "".join([c.get("text", "") for c in data.get("content", [])]).strip()
-
-def call_gemini(base_url: str, model: str, api_key: str, prompt: str) -> str:
-    url = f"{base_url}/{model}:generateContent?key={api_key}"
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, json=body, timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"{r.status_code} {r.reason}: {r.text[:2000]}")
-    data = r.json()
-    candidates = data.get("candidates", [])
-    if not candidates:
-        return json.dumps(data, indent=2)
-    parts = candidates[0].get("content", {}).get("parts", [])
-    return "".join([p.get("text", "") for p in parts]).strip()
-
-def call_llm(provider: str, endpoint: str, model: str, api_key: str, prompt: str) -> str:
-    if provider in ("Promptix Free (LLaMA via Together)", "User: Together"):
-        return call_together(endpoint, model, api_key, prompt)
-    if provider == "User: OpenAI":
-        return call_openai(endpoint, model, api_key, prompt)
-    if provider == "User: Anthropic":
-        return call_anthropic(endpoint, model, api_key, prompt)
-    if provider == "User: Gemini":
-        return call_gemini(endpoint, model, api_key, prompt)
-    raise ValueError("Unsupported provider")
-
-# ---------------------------
-# Sidebar — AI Settings
-# ---------------------------
-st.sidebar.markdown("## 🧠 AI Settings")
-
-provider = st.sidebar.selectbox("Provider", PROVIDERS, index=0, key="px_provider")
-default_endpoint, default_model = provider_defaults(provider)
-
-endpoint = st.sidebar.text_input("API Endpoint", value=default_endpoint, key="px_endpoint")
-model = st.sidebar.text_input("Model", value=default_model, key="px_model")
-
-together_key = (
-    get_secret("TOGETHER_API_KEY")
-    or get_secret("TOGETHER_KEY")
-    or get_secret("TOGETHER_API_TOKEN")
-).strip()
-
-user_key = ""
-if provider == "Promptix Free (LLaMA via Together)":
-    st.sidebar.markdown("🔒 **Using Together key from Streamlit Secrets** (`TOGETHER_API_KEY`).")
-    st.sidebar.info(f"Free calls left today (this session): **{st.session_state.free_calls_left}/10**")
-    if not together_key:
-        st.sidebar.error("Missing key: **TOGETHER_API_KEY** (add it in Streamlit Secrets).")
-else:
-    user_key = st.sidebar.text_input("Your API Key", type="password", key="px_user_key")
-    st.sidebar.caption("Tip: Keep keys private — don’t paste real client data into prompts.")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("🔗 **Get your API key**")
-st.sidebar.markdown(f"- OpenAI: [{API_KEY_LINKS['OpenAI']}]({API_KEY_LINKS['OpenAI']})")
-st.sidebar.markdown(f"- Gemini: [{API_KEY_LINKS['Gemini']}]({API_KEY_LINKS['Gemini']})")
-st.sidebar.markdown(f"- Anthropic: [{API_KEY_LINKS['Anthropic']}]({API_KEY_LINKS['Anthropic']})")
-st.sidebar.markdown(f"- Together: [{API_KEY_LINKS['Together']}]({API_KEY_LINKS['Together']})")
-
-# ---------------------------
-# Header / Hero
-# ---------------------------
-st.markdown(
-    """
-<div class="px-hero">
-  <h1 class="px-title">Promptix AI v2 <span class="px-chip">MVP</span></h1>
-  <div class="px-sub">Turn product requirements into structured, export-ready test cases — with edge cases, negatives, traceability (AC mapping), and risk tagging.</div>
-  <div class="px-stepper">
-    <span class="px-step">1) Scenario Builder</span>
-    <span class="px-step">2) Coverage Scoreboard</span>
-    <span class="px-step">3) Prompt → AI</span>
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-# ---------------------------
-# Sample filler
-# ---------------------------
+# =========================
+# Sample
+# =========================
 SAMPLE = {
     "context": "zepto.com — user added a new address (web + mobile)",
     "requirements": "1) User logs in with valid credentials.\n2) User adds a new address with required fields and saves successfully.\n3) Saved address appears in address list and can be selected.\n4) Invalid/missing fields show inline error messages.",
@@ -391,9 +476,9 @@ def fill_sample():
     st.session_state["context_in"] = SAMPLE["context"]
     st.session_state["req_in"] = SAMPLE["requirements"]
 
-# ---------------------------
+# =========================
 # Main layout
-# ---------------------------
+# =========================
 left, right = st.columns([0.58, 0.42], gap="large")
 
 with left:
@@ -472,10 +557,6 @@ with left:
 
     score, gaps, suggested = compute_quality(context or "", requirements or "", include_neg)
 
-    st.session_state.quality_score = score
-    st.session_state.quality_gaps = gaps
-    st.session_state.suggested_ac = suggested
-
     qc1, qc2 = st.columns([0.35, 0.65], gap="large")
     with qc1:
         st.metric("Clarity & Coverage", f"{score}/100")
@@ -504,7 +585,6 @@ with right:
     st.markdown('<div class="px-h2">🧪 Output Preview</div>', unsafe_allow_html=True)
     st.markdown('<div class="px-muted">Tip: Generate prompt → then Send to AI.</div>', unsafe_allow_html=True)
 
-    # Build payload
     risk_tags = [t.strip() for t in (risk_tags_raw or "").split(",") if t.strip()]
     coverage_flags: List[str] = []
     if include_edges:
@@ -515,6 +595,7 @@ with right:
         coverage_flags.append("Include NFRs (Perf/Sec/A11y)")
 
     payload = {
+_jsonं = {
         "role": role,
         "test_type": test_type,
         "output_format": output_format,
@@ -522,7 +603,7 @@ with right:
         "requirements": requirements or "",
         "coverage_flags": coverage_flags,
         "risk_tags": risk_tags or ["Auth", "Validation", "UI", "API", "Data"],
-        "acceptance_criteria_hint": st.session_state.suggested_ac if (requirements or "").strip() == "" else "",
+        "acceptance_criteria_hint": suggested if (requirements or "").strip() == "" else "",
     }
 
     def do_generate():
@@ -535,6 +616,7 @@ with right:
 
     def do_send():
         st.session_state.last_error = ""
+
         if not st.session_state.generated_prompt:
             do_generate()
 
@@ -543,8 +625,8 @@ with right:
         if provider == "Promptix Free (LLaMA via Together)":
             if not together_key:
                 raise RuntimeError("Missing TOGETHER_API_KEY. Add it in Streamlit Secrets.")
-            if st.session_state.free_calls_left <= 0:
-                raise RuntimeError("Free calls exhausted for this session (10/10).")
+            if remaining <= 0:
+                raise RuntimeError("Free calls exhausted for today in this browser.")
         else:
             if not (user_key or "").strip():
                 raise RuntimeError("Please paste your API key in the sidebar for the selected provider.")
@@ -560,9 +642,9 @@ with right:
             st.session_state.ai_response = text
 
         if provider == "Promptix Free (LLaMA via Together)":
-            st.session_state.free_calls_left = max(0, st.session_state.free_calls_left - 1)
+            spend_free_call()
 
-    # Actions FIRST (fix: response renders immediately; no extra rerun needed)
+    # Actions
     a1, a2 = st.columns([0.5, 0.5], gap="small")
     with a1:
         if st.button("⚡ Generate Prompt (quick)", use_container_width=True):
@@ -573,11 +655,11 @@ with right:
             try:
                 do_send()
                 st.success("AI response generated.")
+                st.rerun()
             except Exception as e:
                 st.session_state.last_error = str(e)
                 st.error(f"Send to AI failed: {e}")
 
-    # Keep the form submit behavior consistent too
     if gen_submit:
         do_generate()
         st.success("Prompt generated.")
@@ -601,9 +683,9 @@ with right:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------------------
+# =========================
 # Footer
-# ---------------------------
+# =========================
 st.markdown(
     """
 <div class="px-footer">
