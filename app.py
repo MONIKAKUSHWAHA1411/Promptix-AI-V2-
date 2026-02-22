@@ -1,142 +1,144 @@
-# app.py — Promptix AI v2 (UI preserved + Supabase Email Login + Daily Limits + Provider/BYOK + Advanced Prompt)
-# Fixes in this version:
-# ✅ No more 1-sec StreamlitDuplicateElementKey flicker on login/logout (cookie ops are queued; only 1 cookie call per run)
-# ✅ Daily limit now persists correctly (reads MAX(count) for the day; works even if multiple rows exist)
-# ✅ When remaining = 0 → toast + message “0 limits remaining, come back in ~24 hours”
-# ✅ Keeps current UI + brings back missing options: sample data, roles, test type, format, advanced prompt, checkboxes, send-to-AI, copy buttons
-# ✅ Reduces top empty space via CSS
+# app.py — Promptix AI v2 (FULL)
+# ✅ Keeps: Current UI feel + Supabase Email Login (reload-safe)
+# ✅ Restores missing options + fixes Together model error handling + copy buttons
+# ✅ Adds: Platform dropdown, richer Test Type + Format options, API Endpoint display
+# ✅ Fix: default Together model -> Meta-Llama 3.1 8B Turbo (more commonly accessible)
 
-import os
 import json
-import time
-import base64
-import secrets
-import datetime
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from typing import Optional, Tuple
 
 import requests
 import streamlit as st
+import extra_streamlit_components as stx
 
-# Optional (recommended) for cookie persistence on Streamlit Cloud
-try:
-    import extra_streamlit_components as stx
-except Exception:
-    stx = None
-
-
-# ==========================================================
+# =========================================================
 # CONFIG
-# ==========================================================
-APP_TITLE = "Promptix AI v2"
-DAILY_FREE_LIMIT = 3
+# =========================================================
+st.set_page_config(page_title="Promptix AI v2", layout="wide")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "").strip()
+SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "").strip()
 
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
+# Server key used ONLY for "Promptix Free"
+TOGETHER_API_KEY_SERVER = st.secrets.get("TOGETHER_API_KEY", "").strip()
 
-# OpenAI-compatible endpoint for Together
-DEFAULT_TOGETHER_ENDPOINT = os.getenv("TOGETHER_API_ENDPOINT", "https://api.together.xyz/v1/chat/completions").rstrip("/")
-DEFAULT_TOGETHER_BASE = DEFAULT_TOGETHER_ENDPOINT.replace("/chat/completions", "").rstrip("/")
+APP_TIMEZONE = st.secrets.get("APP_TIMEZONE", "Asia/Kolkata")
+DAILY_FREE_LIMIT = int(st.secrets.get("DAILY_FREE_LIMIT", 3))
 
-COOKIE_NAME = "px_session_v2"  # store everything in one cookie
-COOKIE_TTL_DAYS = 30
+# OpenAI-compatible endpoints
+TOGETHER_BASE_URL_DEFAULT = st.secrets.get("TOGETHER_BASE_URL", "https://api.together.xyz/v1").strip()
+OPENAI_BASE_URL_DEFAULT = st.secrets.get("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
 
-# If you want "day" to reset in India time:
-APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
+# Sensible defaults
+# NOTE: Your screenshot error indicates the 70B name wasn't accessible. 8B Turbo is safer default.
+TOGETHER_MODEL_SAFE_DEFAULT = st.secrets.get(
+    "TOGETHER_MODEL_SAFE_DEFAULT", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+).strip()
 
+TOGETHER_MODEL_ALT_70B = st.secrets.get(
+    "TOGETHER_MODEL_ALT_70B", "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+).strip()
 
-# ==========================================================
-# PAGE
-# ==========================================================
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+OPENAI_MODEL_DEFAULT = st.secrets.get("OPENAI_MODEL_DEFAULT", "gpt-4o-mini").strip()
+GEMINI_MODEL_DEFAULT = st.secrets.get("GEMINI_MODEL_DEFAULT", "gemini-1.5-flash").strip()
+ANTHROPIC_MODEL_DEFAULT = st.secrets.get("ANTHROPIC_MODEL_DEFAULT", "claude-3-5-sonnet-latest").strip()
 
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    st.error("Missing SUPABASE_URL / SUPABASE_ANON_KEY in Streamlit Secrets.")
+    st.stop()
 
-# ==========================================================
-# STYLES (keep your current UI + reduce top empty space)
-# ==========================================================
+cookie_manager = stx.CookieManager()
+
+# =========================================================
+# UI STYLES (KEEP CURRENT FEEL)
+# =========================================================
 st.markdown(
     """
 <style>
-/* Reduce top padding / empty space */
-section.main > div.block-container { padding-top: 1.1rem !important; padding-bottom: 2rem !important; }
-
-/* Dark gradient background */
-html, body, [data-testid="stAppViewContainer"] {
-  background: radial-gradient(1200px 800px at 30% 10%, rgba(128, 0, 255, 0.18), transparent 60%),
-              radial-gradient(1200px 800px at 90% 20%, rgba(0, 200, 255, 0.10), transparent 55%),
-              linear-gradient(180deg, #0b0f17 0%, #070a10 100%);
+[data-testid="stAppViewContainer"]{
+  background: radial-gradient(1200px 700px at 20% 10%, rgba(255,0,90,0.10), transparent 60%),
+              radial-gradient(1000px 600px at 80% 20%, rgba(0,180,255,0.10), transparent 60%),
+              linear-gradient(180deg, #05070c 0%, #070a12 55%, #05070c 100%);
 }
+header {visibility: hidden;}
+footer {visibility: hidden;}
 
-/* Sidebar */
-[data-testid="stSidebar"] {
-  background: linear-gradient(180deg, rgba(25, 28, 38, 0.75) 0%, rgba(14, 16, 22, 0.75) 100%);
-  border-right: 1px solid rgba(255,255,255,0.06);
+.center-auth{
+  width: 100%;
+  display:flex;
+  justify-content:center;
+  margin-top: 52px;
 }
-
-/* Card look */
-.px-card {
+.px-card{
+  width:min(920px, 94vw);
+  background: rgba(255,255,255,0.04);
   border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 16px;
-  padding: 18px 18px;
-  background: rgba(255,255,255,0.03);
-  box-shadow: 0 10px 35px rgba(0,0,0,0.35);
-}
-
-/* Hero */
-.px-hero {
   border-radius: 18px;
-  padding: 18px 22px;
+  padding: 26px 26px 18px 26px;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.55);
+}
+.px-h2{ font-size: 26px; font-weight: 700; margin-bottom: 6px; }
+.px-muted{ opacity: 0.75; margin-bottom: 16px; }
+
+.hero{
+  width:100%;
+  background: linear-gradient(90deg, rgba(99,102,241,0.55), rgba(147,51,234,0.40));
   border: 1px solid rgba(255,255,255,0.10);
-  background: linear-gradient(135deg, rgba(126, 64, 255, 0.40), rgba(40, 130, 255, 0.10));
+  border-radius: 18px;
+  padding: 20px 22px;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.45);
+}
+.badge{
+  display:inline-block;
+  font-size: 12px;
+  padding: 2px 10px;
+  margin-left: 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.15);
+  border: 1px solid rgba(255,255,255,0.18);
+  vertical-align: middle;
+}
+.subtle{
+  opacity:0.80;
+  margin-top: 6px;
 }
 
-/* Muted text */
-.px-muted { color: rgba(255,255,255,0.72); font-size: 0.95rem; }
-
-/* Auth box center */
-.center-auth {
-  max-width: 980px;
-  margin: 0 auto;
+.callout{
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.10);
+  padding: 14px 16px;
+  background: rgba(255, 196, 0, 0.10);
 }
 
-/* Pills */
-.px-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 9px 12px;
-  border-radius: 12px;
-  background: rgba(30, 120, 255, 0.12);
-  border: 1px solid rgba(30, 120, 255, 0.25);
+.px-footer{
+  margin-top: 34px;
+  text-align:center;
+  opacity:0.75;
+  font-size: 13px;
+}
+.px-footer a{ color: #7dd3fc; text-decoration:none; }
+.px-footer a:hover{ text-decoration:underline; }
+
+.px-links a { color:#7dd3fc !important; text-decoration:none; }
+.px-links a:hover { text-decoration:underline; }
+
+.kpi-box{
+  border-radius: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.04);
+}
+.kpi-green{
+  border-radius: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(34,197,94,0.30);
+  background: rgba(34,197,94,0.12);
 }
 
-/* Footer */
-.px-footer {
-  margin-top: 30px;
-  padding-top: 18px;
-  border-top: 1px solid rgba(255,255,255,0.06);
-  text-align: center;
-  color: rgba(255,255,255,0.70);
-  font-size: 0.9rem;
-}
-.px-footer a { color: rgba(120, 190, 255, 0.95); text-decoration: none; }
-.px-footer a:hover { text-decoration: underline; }
-
-/* Smaller expander padding */
-div[data-testid="stExpander"] > details > summary {
-  font-size: 1rem;
-}
-
-/* Make text areas a bit taller by default */
-textarea { min-height: 140px !important; }
-
-/* Reduce empty top space for login header line */
-.px-auth-spacer { height: 8px; }
-
-/* Better buttons */
-.stButton > button, .stDownloadButton > button {
+/* Improve text area look */
+textarea {
   border-radius: 12px !important;
 }
 </style>
@@ -144,515 +146,259 @@ textarea { min-height: 140px !important; }
     unsafe_allow_html=True,
 )
 
+# =========================================================
+# TIME HELPERS
+# =========================================================
+def today_local_iso() -> str:
+    tz = ZoneInfo(APP_TIMEZONE)
+    return datetime.now(tz).date().isoformat()
 
-# ==========================================================
-# HELPERS
-# ==========================================================
-def now_local_date_str() -> str:
-    """Return YYYY-MM-DD in desired timezone (best-effort)."""
+def _safe_json(resp: requests.Response):
     try:
-        from zoneinfo import ZoneInfo  # py3.9+
-        tz = ZoneInfo(APP_TIMEZONE)
-        return datetime.datetime.now(tz).date().isoformat()
-    except Exception:
-        return datetime.date.today().isoformat()
-
-
-def toast(msg: str, icon: str = "ℹ️"):
-    """Toast if available, else fallback."""
-    try:
-        st.toast(msg, icon=icon)
-    except Exception:
-        st.info(msg)
-
-
-def safe_json_loads(s: str) -> Optional[dict]:
-    try:
-        return json.loads(s)
+        return resp.json()
     except Exception:
         return None
 
+def _sb_headers(access_token: Optional[str] = None) -> dict:
+    return {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {access_token or SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
 
-def b64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-
-def make_state() -> str:
-    return b64url_encode(secrets.token_bytes(24))
-
-
-# ==========================================================
-# COOKIE MANAGER (queued ops to avoid DuplicateElementKey)
-# ==========================================================
-cookie_manager = stx.CookieManager() if stx is not None else None
-
-def queue_cookie_set(value: str):
-    st.session_state["_cookie_action"] = "set"
-    st.session_state["_cookie_value"] = value
-
-
-def queue_cookie_delete():
-    st.session_state["_cookie_action"] = "delete"
-    st.session_state["_cookie_value"] = ""
-
-
-def process_cookie_queue_once():
-    """
-    IMPORTANT FIX:
-    Only ONE cookie_manager call is allowed per script run (otherwise DuplicateElementKey flicker).
-    We queue cookie ops and execute them on the *next* run.
-    """
-    if cookie_manager is None:
-        return
-
-    action = st.session_state.get("_cookie_action")
-    if not action:
-        return
-
-    if action == "set":
-        value = st.session_state.get("_cookie_value", "")
-        # cookie ttl not always supported by all versions, but CookieManager generally supports it.
-        try:
-            cookie_manager.set(COOKIE_NAME, value, key=COO KIE_NAME if False else COOKIE_NAME)
-        except TypeError:
-            # Some versions don't accept extra args
-            cookie_manager.set(COOKIE_NAME, value)
-    elif action == "delete":
-        try:
-            cookie_manager.delete(COOKIE_NAME)
-        except Exception:
-            # ignore
-            pass
-
-    # clear queue and rerun
-    st.session_state.pop("_cookie_action", None)
-    st.session_state.pop("_cookie_value", None)
-    st.rerun()
-
-
-def bootstrap_session_from_cookie_once():
-    """Read cookie ONCE per run (and only when no queued cookie action)."""
-    if cookie_manager is None:
-        return
-    if st.session_state.get("_bootstrapped_cookie"):
-        return
-
-    # Only read if no queued operation
-    if st.session_state.get("_cookie_action"):
-        return
-
+# =========================================================
+# SUPABASE AUTH (NO CRASH)
+# =========================================================
+def supabase_sign_in(email: str, password: str) -> Tuple[Optional[dict], Optional[str]]:
+    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
     try:
-        raw = cookie_manager.get(COOKIE_NAME)
+        r = requests.post(url, headers=_sb_headers(None), json={"email": email, "password": password}, timeout=20)
+    except Exception as e:
+        return None, f"Network error: {e}"
+    if r.status_code != 200:
+        j = _safe_json(r)
+        msg = (j.get("error_description") or j.get("message") or j.get("msg")) if isinstance(j, dict) else None
+        return None, f"{r.status_code}: {msg or r.text.strip()}"
+    return r.json(), None
+
+def supabase_sign_up(email: str, password: str) -> Tuple[Optional[dict], Optional[str]]:
+    url = f"{SUPABASE_URL}/auth/v1/signup"
+    try:
+        r = requests.post(url, headers=_sb_headers(None), json={"email": email, "password": password}, timeout=20)
+    except Exception as e:
+        return None, f"Network error: {e}"
+    if r.status_code not in (200, 201):
+        j = _safe_json(r)
+        msg = (j.get("error_description") or j.get("message") or j.get("msg")) if isinstance(j, dict) else None
+        return None, f"{r.status_code}: {msg or r.text.strip()}"
+    return r.json(), None
+
+def supabase_get_user(access_token: str) -> Optional[dict]:
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    try:
+        r = requests.get(url, headers=_sb_headers(access_token), timeout=15)
     except Exception:
-        raw = None
+        return None
+    if r.status_code != 200:
+        return None
+    return _safe_json(r)
 
-    if raw:
-        payload = safe_json_loads(raw)
-        if payload and isinstance(payload, dict):
-            # Minimal restore
-            user = payload.get("user")
-            access_token = payload.get("access_token", "")
-            refresh_token = payload.get("refresh_token", "")
+def supabase_refresh(refresh_token: str) -> Tuple[Optional[dict], Optional[str]]:
+    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token"
+    try:
+        r = requests.post(url, headers=_sb_headers(None), json={"refresh_token": refresh_token}, timeout=20)
+    except Exception as e:
+        return None, f"Network error: {e}"
+    if r.status_code != 200:
+        j = _safe_json(r)
+        msg = (j.get("error_description") or j.get("message") or j.get("msg")) if isinstance(j, dict) else None
+        return None, f"{r.status_code}: {msg or r.text.strip()}"
+    return r.json(), None
 
-            if user and isinstance(user, dict) and user.get("id") and user.get("email"):
-                st.session_state["user"] = {"id": user["id"], "email": user["email"]}
-                st.session_state["access_token"] = access_token
-                st.session_state["refresh_token"] = refresh_token
+# =========================================================
+# COOKIE SESSION
+# =========================================================
+COOKIE_KEYS = {
+    "user_id": "px_user_id",
+    "user_email": "px_user_email",
+    "access_token": "px_access_token",
+    "refresh_token": "px_refresh_token",
+}
 
-    st.session_state["_bootstrapped_cookie"] = True
+def save_session_to_cookie(user_id: str, email: str, access_token: str, refresh_token: str):
+    max_age = 60 * 60 * 24 * 30
+    cookie_manager.set(COOKIE_KEYS["user_id"], user_id, max_age=max_age)
+    cookie_manager.set(COOKIE_KEYS["user_email"], email, max_age=max_age)
+    cookie_manager.set(COOKIE_KEYS["access_token"], access_token, max_age=max_age)
+    cookie_manager.set(COOKIE_KEYS["refresh_token"], refresh_token, max_age=max_age)
 
+def clear_cookie_session():
+    for k in COOKIE_KEYS.values():
+        cookie_manager.delete(k)
 
-def set_auth_session(user_id: str, email: str, access_token: str, refresh_token: str):
-    st.session_state["user"] = {"id": user_id, "email": email}
-    st.session_state["access_token"] = access_token
-    st.session_state["refresh_token"] = refresh_token
+def apply_auth_session(user_obj: dict, access_token: str, refresh_token: str):
+    user_id = user_obj.get("id", "")
+    email = user_obj.get("email", "")
+    st.session_state.user = {"id": user_id, "email": email}
+    st.session_state.access_token = access_token
+    st.session_state.refresh_token = refresh_token
+    save_session_to_cookie(user_id, email, access_token, refresh_token)
 
-    # Queue cookie write (NOT immediate)
-    value = json.dumps(
-        {
-            "user": {"id": user_id, "email": email},
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "ts": int(time.time()),
-        }
-    )
-    queue_cookie_set(value)
+def try_bootstrap_session_from_cookie():
+    if st.session_state.get("bootstrapped", False):
+        return
+    st.session_state.bootstrapped = True
 
+    cookies = cookie_manager.get_all() or {}
+    access_token = cookies.get(COOKIE_KEYS["access_token"])
+    refresh_token = cookies.get(COOKIE_KEYS["refresh_token"])
+    user_id = cookies.get(COOKIE_KEYS["user_id"])
+    user_email = cookies.get(COOKIE_KEYS["user_email"])
 
-def clear_auth_session():
+    if not access_token or not refresh_token or not user_id:
+        return
+
+    user = supabase_get_user(access_token)
+    if user and user.get("id") == user_id:
+        st.session_state.user = {"id": user_id, "email": user.get("email", user_email or "")}
+        st.session_state.access_token = access_token
+        st.session_state.refresh_token = refresh_token
+        return
+
+    data, err = supabase_refresh(refresh_token)
+    if err or not data:
+        clear_cookie_session()
+        return
+
+    new_access = data.get("access_token", "")
+    new_refresh = data.get("refresh_token", refresh_token)
+    user_obj = data.get("user") or supabase_get_user(new_access) or {}
+
+    if user_obj.get("id"):
+        apply_auth_session(user_obj, new_access, new_refresh)
+
+def is_authed() -> bool:
+    return bool(st.session_state.get("user", {}).get("id")) and bool(st.session_state.get("access_token"))
+
+def do_logout():
     st.session_state.pop("user", None)
     st.session_state.pop("access_token", None)
     st.session_state.pop("refresh_token", None)
-    queue_cookie_delete()
+    clear_cookie_session()
+    st.rerun()
 
-
-# ==========================================================
-# SUPABASE AUTH (Email/Password)
-# ==========================================================
-def supabase_headers(access_token: Optional[str] = None) -> Dict[str, str]:
-    h = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Content-Type": "application/json",
-    }
-    if access_token:
-        h["Authorization"] = f"Bearer {access_token}"
-    return h
-
-
-def supabase_sign_in(email: str, password: str) -> Dict[str, Any]:
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise RuntimeError("Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY in Streamlit secrets/env.")
-    url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
-    r = requests.post(url, headers=supabase_headers(), json={"email": email, "password": password}, timeout=30)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Login failed: {r.text[:800]}")
-    return r.json()
-
-
-def supabase_sign_up(email: str, password: str) -> Dict[str, Any]:
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise RuntimeError("Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY in Streamlit secrets/env.")
-    url = f"{SUPABASE_URL}/auth/v1/signup"
-    r = requests.post(url, headers=supabase_headers(), json={"email": email, "password": password}, timeout=30)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Signup failed: {r.text[:800]}")
-    return r.json()
-
-
-# ==========================================================
-# SUPABASE USAGE LIMITS (robust: uses MAX(count))
-# Table recommended: promptix_usage(user_id text/uuid, usage_date text/date, count int, updated_at timestamp)
-# ==========================================================
-def usage_table_headers() -> Dict[str, str]:
-    token = st.session_state.get("access_token", "")
-    return {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
-
-def fetch_usage_rows(user_id: str, usage_date: str) -> List[Dict[str, Any]]:
-    if not SUPABASE_URL:
-        return []
-    # Read all rows for that day. We'll take MAX(count) to stay correct even if duplicates exist.
-    url = f"{SUPABASE_URL}/rest/v1/promptix_usage?user_id=eq.{user_id}&usage_date=eq.{usage_date}&select=count,updated_at"
-    r = requests.get(url, headers=usage_table_headers(), timeout=20)
-    if r.status_code >= 300:
-        return []
+# =========================================================
+# SUPABASE USAGE (PERSISTENT) — Promptix Free only
+# =========================================================
+def get_daily_usage(user_id: str, access_token: str, usage_date: str) -> int:
+    url = f"{SUPABASE_URL}/rest/v1/promptix_usage?user_id=eq.{user_id}&usage_date=eq.{usage_date}&select=count"
     try:
-        data = r.json()
-        return data if isinstance(data, list) else []
+        r = requests.get(url, headers=_sb_headers(access_token), timeout=15)
     except Exception:
-        return []
-
-
-def get_daily_used_count(user_id: str, usage_date: str) -> int:
-    rows = fetch_usage_rows(user_id, usage_date)
-    if not rows:
         return 0
-    max_count = 0
-    for row in rows:
-        try:
-            c = int(row.get("count", 0))
-            if c > max_count:
-                max_count = c
-        except Exception:
-            continue
-    return max_count
+    if r.status_code != 200:
+        return 0
+    j = _safe_json(r)
+    if isinstance(j, list) and j and isinstance(j[0], dict):
+        return int(j[0].get("count", 0) or 0)
+    return 0
 
-
-def write_daily_count_upsert(user_id: str, usage_date: str, new_count: int) -> bool:
-    """
-    Try upsert (best), requires UNIQUE(user_id, usage_date) on the table.
-    If not available, this may fail and we fall back to insert.
-    """
-    if not SUPABASE_URL:
-        return False
-    url = f"{SUPABASE_URL}/rest/v1/promptix_usage?on_conflict=user_id,usage_date"
-    headers = usage_table_headers()
+def set_daily_usage(user_id: str, access_token: str, usage_date: str, new_count: int) -> bool:
+    url = f"{SUPABASE_URL}/rest/v1/promptix_usage"
+    headers = _sb_headers(access_token)
     headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
     payload = {
         "user_id": user_id,
         "usage_date": usage_date,
         "count": int(new_count),
-        "updated_at": datetime.datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    return r.status_code < 300
-
-
-def write_daily_count_insert(user_id: str, usage_date: str, new_count: int) -> bool:
-    if not SUPABASE_URL:
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+    except Exception:
         return False
-    url = f"{SUPABASE_URL}/rest/v1/promptix_usage"
-    headers = usage_table_headers()
-    headers["Prefer"] = "return=minimal"
-    payload = {
-        "user_id": user_id,
-        "usage_date": usage_date,
-        "count": int(new_count),
-        "updated_at": datetime.datetime.utcnow().isoformat(),
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    return r.status_code < 300
+    return r.status_code in (201, 204)
 
-
-def increment_daily_usage(user_id: str, usage_date: str) -> int:
-    """
-    Robust increment:
-    - Read MAX(count)
-    - new = current + 1
-    - try upsert; if fails, insert a new row
-    - return new (or current if all failed)
-    """
-    current = get_daily_used_count(user_id, usage_date)
+def increment_daily_usage(user_id: str, access_token: str, usage_date: str) -> int:
+    current = get_daily_usage(user_id, access_token, usage_date)
     new_count = current + 1
+    ok = set_daily_usage(user_id, access_token, usage_date, new_count)
+    return new_count if ok else current
 
-    ok = write_daily_count_upsert(user_id, usage_date, new_count)
-    if ok:
-        return new_count
-
-    ok2 = write_daily_count_insert(user_id, usage_date, new_count)
-    if ok2:
-        return new_count
-
-    return current
-
-
-# ==========================================================
-# LLM PROVIDERS / MODELS
-# ==========================================================
-@dataclass
-class ProviderConfig:
-    key: str
-    label: str
-    kind: str  # "free" or "byok"
-    vendor: str  # together/openai/gemini/anthropic
-    needs_key: bool
-
-
-PROVIDERS = [
-    ProviderConfig("promptix_free", "Promptix Free (LLaMA via Together)", "free", "together", False),
-    ProviderConfig("together_byok", "Together LLaMA (BYOK)", "byok", "together", True),
-    ProviderConfig("openai_byok", "OpenAI (BYOK)", "byok", "openai", True),
-    ProviderConfig("gemini_byok", "Google Gemini (BYOK)", "byok", "gemini", True),
-    ProviderConfig("anthropic_byok", "Anthropic Claude (BYOK)", "byok", "anthropic", True),
+# =========================================================
+# TOGETHER MODEL HELPERS (for the "Unable to access model" error)
+# =========================================================
+TOGETHER_SUGGESTED_MODELS = [
+    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+    "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "meta-llama/Meta-Llama-3-8B-Instruct-Turbo",
+    "meta-llama/Meta-Llama-3-70B-Instruct-Turbo",
 ]
 
-# Together model list (safe defaults; user can change)
-TOGETHER_MODELS = [
-    ("meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo", "(Recommended) meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"),
-    ("meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"),
-    ("mistralai/Mixtral-8x7B-Instruct-v0.1", "mistralai/Mixtral-8x7B-Instruct-v0.1"),
-]
+def together_list_models(api_key: str) -> Optional[set]:
+    """Best-effort model list (no hard failure if it can't fetch)."""
+    if not api_key:
+        return None
+    try:
+        r = requests.get(
+            TOGETHER_BASE_URL_DEFAULT.rstrip("/") + "/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        data = j.get("data", [])
+        names = set()
+        for m in data:
+            if isinstance(m, dict) and m.get("id"):
+                names.add(m["id"])
+        return names or None
+    except Exception:
+        return None
 
-OPENAI_MODELS = [
-    ("gpt-4o-mini", "gpt-4o-mini"),
-    ("gpt-4.1-mini", "gpt-4.1-mini"),
-    ("gpt-4o", "gpt-4o"),
-]
-
-GEMINI_MODELS = [
-    ("gemini-1.5-flash", "gemini-1.5-flash"),
-    ("gemini-1.5-pro", "gemini-1.5-pro"),
-]
-
-ANTHROPIC_MODELS = [
-    ("claude-3-5-sonnet-latest", "claude-3-5-sonnet-latest"),
-    ("claude-3-5-haiku-latest", "claude-3-5-haiku-latest"),
-]
-
-
-# ==========================================================
-# PROMPT OPTIONS (RESTORED)
-# ==========================================================
-TESTING_ROLES = [
-    "QA Tester — Manual testing expert",
-    "QA Automation Engineer — Selenium/Playwright",
-    "SDET — End-to-end + CI quality gates",
-    "Product QA — UX + Acceptance validation",
-    "API QA — Postman/Newman + contract testing",
-    "Security QA — OWASP basics + threat checks",
-    "Performance QA — Load/latency checks (basic)",
-    "Accessibility QA — WCAG validations (basic)",
-]
-
-TEST_TYPES = [
-    "Functional Testing",
-    "Smoke Testing",
-    "Sanity Testing",
-    "Regression Testing",
-    "UI Testing",
-    "API Testing",
-    "Integration Testing",
-    "E2E Testing",
-    "Accessibility (basic)",
-    "Security (basic)",
-    "Performance (basic)",
-]
-
-TEST_MANAGEMENT_FORMATS = [
-    "Standard/Detailed — Comprehensive format",
-    "Jira/Zephyr — Atlassian import style",
-    "TestRail — TestRail format",
-    "Cucumber/BDD — Gherkin syntax",
-    "Excel/CSV — Generic import format",
-    "Custom — I will define",
-]
-
-PLATFORMS = ["Web", "Mobile", "API", "Web + API", "Mobile + API"]
-
-PRIORITY_SCHEMES = ["P0/P1/P2", "High/Medium/Low", "Critical/Major/Minor", "P1/P2/P3/P4"]
-
-
-# ==========================================================
-# PROMPT BUILDERS
-# ==========================================================
-def build_advanced_prompt(data: Dict[str, Any]) -> str:
-    role = data.get("role", "QA Tester — Manual testing expert")
-    test_type = data.get("test_type", "Functional Testing")
-    fmt = data.get("format", "Standard/Detailed — Comprehensive format")
-    platform = data.get("platform", "Web")
-
-    context = data.get("context", "").strip()
-    req = data.get("requirements", "").strip()
-    acc = data.get("acceptance", "").strip()
-    edges = data.get("edge_cases", "").strip()
-    nfr = data.get("nfr", "").strip()
-
-    comprehensive = data.get("comprehensive", True)
-    include_edge = data.get("include_edge_cases", True)
-    include_negative = data.get("include_negative", True)
-
-    include_boundary = data.get("include_boundary", True)
-    include_ui = data.get("include_ui", True)
-    include_api = data.get("include_api", False)
-
-    include_access = data.get("include_accessibility", False)
-    include_security = data.get("include_security", False)
-    include_perf = data.get("include_performance", False)
-
-    n_cases = int(data.get("n_cases", 20))
-    tc_prefix = data.get("tc_prefix", "TC")
-    priority_scheme = data.get("priority_scheme", "P0/P1/P2")
-
-    # Instructions by format
-    format_instruction = ""
-    if fmt.startswith("Jira/Zephyr"):
-        format_instruction = "Output in a Jira/Zephyr-friendly table with columns: Summary, Preconditions, Steps, Expected Result, Priority, Labels."
-    elif fmt.startswith("TestRail"):
-        format_instruction = "Output in TestRail style with: Title, Preconditions, Steps, Expected Result, Priority."
-    elif fmt.startswith("Cucumber/BDD"):
-        format_instruction = "Output in Gherkin with Feature/Scenario, Given/When/Then, include tags for priority."
-    elif fmt.startswith("Excel/CSV"):
-        format_instruction = "Output as CSV-friendly rows: ID, Title, Preconditions, Steps, Expected, Priority."
-    elif fmt.startswith("Custom"):
-        format_instruction = "Ask 2 clarification questions first, then output in a structured format you propose."
-
-    coverage_flags = []
-    if comprehensive:
-        coverage_flags.append("Comprehensive coverage")
-    if include_edge:
-        coverage_flags.append("Edge cases")
-    if include_negative:
-        coverage_flags.append("Negative tests")
-    if include_boundary:
-        coverage_flags.append("Boundary/validation tests")
-    if include_ui:
-        coverage_flags.append("UI validations")
-    if include_api:
-        coverage_flags.append("API validations")
-    if include_access:
-        coverage_flags.append("Accessibility checks (basic)")
-    if include_security:
-        coverage_flags.append("Security checks (basic)")
-    if include_perf:
-        coverage_flags.append("Performance checks (basic)")
-
-    flags_text = ", ".join(coverage_flags) if coverage_flags else "Standard coverage"
-
-    prompt = f"""You are acting as: {role}
-
-TASK:
-Create {n_cases} high-quality QA test cases for: {test_type}
-Platform: {platform}
-Test Management Format: {fmt}
-Priority scheme: {priority_scheme}
-Test case ID prefix: {tc_prefix}
-
-COVERAGE REQUIRED:
-{flags_text}
-
-CONTEXT (What are we testing?):
-{context if context else "[Add product/module context here]"}
-
-REQUIREMENTS (What should it do?):
-{req if req else "[Add user story / requirements here]"}
-
-ACCEPTANCE CRITERIA (if any):
-{acc if acc else "[Optional]"}
-
-EDGE CASES / NEGATIVE SCENARIOS (if any):
-{edges if edges else "[Optional]"}
-
-NON-FUNCTIONAL FOCUS (if any):
-{nfr if nfr else "[Optional]"}
-
-OUTPUT RULES:
-- Be specific and executable.
-- Include Preconditions.
-- Steps should be atomic and numbered.
-- Expected results must be clear.
-- Assign Priority using: {priority_scheme}
-- Use IDs like: {tc_prefix}-001, {tc_prefix}-002, ...
-- Avoid real secrets or personal data.
-{("- " + format_instruction) if format_instruction else ""}
-"""
-    return prompt
-
-
-# ==========================================================
+# =========================================================
 # LLM CALLS
-# ==========================================================
-def call_together_chat(api_key: str, model: str, messages: List[Dict[str, str]], base_url: str) -> str:
-    url = f"{base_url}/chat/completions"
+# =========================================================
+def call_openai_compatible(base_url: str, api_key: str, model: str, prompt: str) -> str:
+    url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": 1400,
+        "messages": [
+            {"role": "system", "content": "You are a senior QA engineer. Follow instructions exactly and output in requested format."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.35,
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(r.text[:1200])
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    if r.status_code != 200:
+        j = _safe_json(r)
+        msg = None
+        if isinstance(j, dict):
+            msg = (j.get("error") or {}).get("message") or j.get("message")
+        raise RuntimeError(msg or r.text)
     j = r.json()
-    return j["choices"][0]["message"]["content"]
-
-
-def call_openai_chat(api_key: str, model: str, messages: List[Dict[str, str]]) -> str:
-    # OpenAI official endpoint
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.2}
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(r.text[:1200])
-    j = r.json()
-    return j["choices"][0]["message"]["content"]
-
+    return j["choices"][0]["message"]["content"].strip()
 
 def call_gemini(api_key: str, model: str, prompt: str) -> str:
-    # Minimal Gemini REST (text)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, json=payload, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(r.text[:1200])
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.35},
+    }
+    r = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=90)
+    if r.status_code != 200:
+        j = _safe_json(r)
+        msg = j.get("error", {}).get("message") if isinstance(j, dict) else None
+        raise RuntimeError(msg or r.text)
     j = r.json()
-    return j["candidates"][0]["content"]["parts"][0]["text"]
-
+    candidates = j.get("candidates", [])
+    if not candidates:
+        return ""
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join([p.get("text", "") for p in parts if isinstance(p, dict)]).strip()
 
 def call_anthropic(api_key: str, model: str, prompt: str) -> str:
     url = "https://api.anthropic.com/v1/messages"
@@ -663,443 +409,683 @@ def call_anthropic(api_key: str, model: str, prompt: str) -> str:
     }
     payload = {
         "model": model,
-        "max_tokens": 1400,
-        "temperature": 0.2,
+        "max_tokens": 1800,
+        "temperature": 0.35,
         "messages": [{"role": "user", "content": prompt}],
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(r.text[:1200])
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    if r.status_code != 200:
+        j = _safe_json(r)
+        msg = j.get("error", {}).get("message") if isinstance(j, dict) else None
+        raise RuntimeError(msg or r.text)
     j = r.json()
-    # Anthropic returns list content blocks
-    parts = j.get("content", [])
-    texts = []
-    for p in parts:
-        if p.get("type") == "text":
-            texts.append(p.get("text", ""))
-    return "\n".join(texts).strip()
+    content = j.get("content", [])
+    if not content:
+        return ""
+    return content[0].get("text", "").strip()
 
+# =========================================================
+# PROMPT ENGINEERING (RESTORED + EXPANDED OPTIONS)
+# =========================================================
+TESTING_ROLES = [
+    "QA Tester — Manual testing expert",
+    "QA Engineer — Functional + Regression",
+    "QA Automation Engineer — Selenium/Playwright",
+    "SDET — Automation + Framework design",
+    "QA Lead — Strategy + Risk-based testing",
+    "Product QA — UX + Acceptance validation",
+    "API QA — Contract + Integration testing",
+    "Performance QA — Load/Stress basics",
+    "Security QA — OWASP basics",
+    "Accessibility QA — WCAG basics",
+]
 
-# ==========================================================
-# COPY BUTTON (RESTORED)
-# ==========================================================
-def clipboard_button(label: str, text: str, btn_key: str):
-    # A small HTML/JS clipboard button (works in Streamlit Cloud too)
-    safe_text = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
-    st.components.v1.html(
-        f"""
-        <div style="display:flex; gap:10px; align-items:center; margin-top:6px;">
-          <button id="{btn_key}" style="
-            padding:10px 14px; border-radius:12px;
-            border:1px solid rgba(255,255,255,0.18);
-            background: rgba(255,255,255,0.06);
-            color: rgba(255,255,255,0.92);
-            cursor:pointer;">
-            📋 {label}
-          </button>
-          <span id="{btn_key}-status" style="color: rgba(255,255,255,0.65); font-size: 0.9rem;"></span>
-        </div>
-        <script>
-          const btn = document.getElementById("{btn_key}");
-          const status = document.getElementById("{btn_key}-status");
-          btn.addEventListener("click", async () => {{
+# This "Test Type" dropdown is the classic QA type (functional/smoke/etc.)
+TEST_TYPES = [
+    "Functional Testing",
+    "Smoke Testing",
+    "Sanity Testing",
+    "Regression Testing",
+    "UI Testing",
+    "API Testing",
+    "Integration Testing",
+    "End-to-End (E2E) Testing",
+    "Accessibility Testing",
+    "Security Testing (basic)",
+    "Performance Testing (basic)",
+]
+
+PLATFORMS = ["Web", "Mobile", "API", "Web + API", "Mobile + API"]
+
+# Match your screenshot style (Jira/Zephyr, Excel/CSV, Custom)
+TEST_MGMT_FORMATS = [
+    "Standard/Detailed — Comprehensive format",
+    "Jira/Zephyr — Atlassian import style",
+    "TestRail — TestRail format",
+    "Cucumber/BDD — Gherkin syntax",
+    "Excel/CSV — Generic import format",
+    "Custom — I will define",
+]
+
+def fill_sample_data():
+    st.session_state.px_platform = "Web"
+    st.session_state.px_context = "zepto.com — user added a new address"
+    st.session_state.px_requirements = "User logs in with valid credentials, adds a new address, and sees it saved correctly."
+    st.session_state.px_additional = "Consider invalid address fields, network timeouts, duplicates, and location pin issues."
+    st.session_state.px_role = TESTING_ROLES[0]
+    st.session_state.px_test_type = "Functional Testing"
+    st.session_state.px_format = TEST_MGMT_FORMATS[0]
+    st.session_state.px_custom_format_notes = ""
+    st.session_state.px_cases = 20
+    st.session_state.px_id_prefix = "TC"
+    st.session_state.px_priority = "P0/P1/P2"
+    st.session_state.px_include_comprehensive = True
+    st.session_state.px_include_edge = True
+    st.session_state.px_include_negative = True
+    st.session_state.px_include_boundary = True
+    st.session_state.px_include_ui = True
+    st.session_state.px_include_api = False
+    st.session_state.px_include_accessibility = False
+    st.session_state.px_include_security = False
+    st.session_state.px_include_performance = False
+
+def build_advanced_prompt(cfg: dict) -> str:
+    role = cfg["role"]
+    test_type = cfg["test_type"]
+    fmt = cfg["format"]
+    platform = cfg.get("platform", "Web")
+    context = cfg["context"].strip()
+    req = cfg["requirements"].strip()
+    add = cfg["additional"].strip()
+
+    n_cases = cfg["n_cases"]
+    id_prefix = cfg["id_prefix"].strip() or "TC"
+    priority_scheme = cfg["priority_scheme"]
+    custom_notes = (cfg.get("custom_format_notes") or "").strip()
+
+    flags = []
+    if cfg["include_comprehensive"]: flags.append("Comprehensive coverage")
+    if cfg["include_edge"]: flags.append("Edge cases")
+    if cfg["include_negative"]: flags.append("Negative tests")
+    if cfg["include_boundary"]: flags.append("Boundary/validation tests")
+    if cfg["include_ui"]: flags.append("UI validations")
+    if cfg["include_api"]: flags.append("API validations")
+    if cfg["include_accessibility"]: flags.append("Accessibility basics (WCAG)")
+    if cfg["include_security"]: flags.append("Security basics (OWASP)")
+    if cfg["include_performance"]: flags.append("Performance basics (latency/throughput)")
+    focus = ", ".join(flags) if flags else "Functional coverage"
+
+    # Output instructions by format
+    if fmt.startswith("Cucumber/BDD"):
+        output_instructions = (
+            "Output strictly in BDD Gherkin:\n"
+            "- Provide a Feature title\n"
+            "- Write 8–15 Scenarios with Given/When/Then\n"
+            "- Include tags like @smoke @regression @negative where relevant\n"
+        )
+    elif fmt.startswith("Excel/CSV"):
+        output_instructions = (
+            "Output as CSV in plain text (comma-separated) with header:\n"
+            "TestCaseID,Title,Preconditions,Steps,ExpectedResult,Priority,Type\n"
+        )
+    elif fmt.startswith("Jira/Zephyr"):
+        output_instructions = (
+            "Output as a Markdown table with columns:\n"
+            "Test Case ID | Title | Preconditions | Steps | Expected Result | Priority | Type\n"
+            "Make titles concise and import-friendly for Jira/Zephyr. Keep steps structured.\n"
+        )
+    elif fmt.startswith("TestRail"):
+        output_instructions = (
+            "Output as a Markdown table with columns:\n"
+            "Test Case ID | Title | Preconditions | Steps | Expected Result | Priority | Type\n"
+            "Make steps explicit and structured for TestRail.\n"
+        )
+    elif fmt.startswith("Custom"):
+        output_instructions = (
+            "Output in the custom format described below. If anything is unclear, pick the closest reasonable structure.\n"
+            f"CUSTOM FORMAT NOTES:\n{custom_notes if custom_notes else '(No custom notes provided — use a clean detailed table format.)'}\n"
+        )
+    else:
+        output_instructions = (
+            "Output as a Markdown table with columns:\n"
+            "Test Case ID | Title | Preconditions | Steps | Expected Result | Priority | Type\n"
+        )
+
+    prompt = f"""
+You are acting as: {role}
+
+TASK:
+Create {n_cases} high-quality QA test cases for: {test_type}
+
+PLATFORM / SURFACE:
+{platform}
+
+CONTEXT (What are we testing?):
+{context}
+
+REQUIREMENTS (What should it do?):
+{req}
+
+ADDITIONAL INFORMATION:
+{add if add else "(none)"}
+
+COVERAGE FOCUS:
+{focus}
+
+QUALITY BAR:
+- Mix functional + negative + edge/boundary where applicable
+- Include validations, error messaging, state handling, and idempotency where relevant
+- Avoid hallucinating features that are not implied by the requirements
+- Clearly state assumptions only when necessary
+
+PRIORITY:
+Use {priority_scheme}
+
+TEST CASE ID:
+Use IDs like {id_prefix}-001, {id_prefix}-002, ... sequentially.
+
+OUTPUT FORMAT (STRICT):
+{output_instructions}
+
+IMPORTANT:
+- Do not include any real secrets or private data.
+- Keep results demo-friendly and export-ready.
+""".strip()
+
+    return prompt
+
+# =========================================================
+# CLIPBOARD (Copy buttons) — JS component
+# =========================================================
+def clipboard_button(label: str, text_to_copy: str, button_id: str):
+    # Use a small HTML/JS snippet for copy-to-clipboard
+    safe_text = (text_to_copy or "").replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    html = f"""
+    <div style="margin: 6px 0 10px 0;">
+      <button id="{button_id}"
+        style="
+          padding:10px 14px;
+          border-radius:12px;
+          border:1px solid rgba(255,255,255,0.14);
+          background: rgba(255,255,255,0.06);
+          color: rgba(255,255,255,0.90);
+          cursor:pointer;
+          width: 100%;
+        "
+      >{label}</button>
+      <script>
+        const btn = document.getElementById("{button_id}");
+        if(btn) {{
+          btn.onclick = async () => {{
             try {{
               await navigator.clipboard.writeText(`{safe_text}`);
-              status.innerText = "Copied ✅";
-              setTimeout(() => status.innerText = "", 1200);
-            }} catch(e) {{
-              status.innerText = "Copy failed";
-              setTimeout(() => status.innerText = "", 1200);
+              btn.innerText = "✅ Copied!";
+              setTimeout(()=>btn.innerText="{label}", 1400);
+            }} catch (e) {{
+              btn.innerText = "❌ Copy failed";
+              setTimeout(()=>btn.innerText="{label}", 1400);
             }}
-          }});
-        </script>
-        """,
-        height=58,
-    )
+          }};
+        }}
+      </script>
+    </div>
+    """
+    st.components.v1.html(html, height=60)
 
-
-# ==========================================================
-# UI — LOGIN PAGE
-# ==========================================================
-def render_login():
-    st.markdown('<div class="center-auth">', unsafe_allow_html=True)
-    st.markdown('<div class="px-auth-spacer"></div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="px-card">', unsafe_allow_html=True)
-    st.markdown(f'<div style="font-size:1.6rem; font-weight:700;">🔐 Login to Promptix</div>', unsafe_allow_html=True)
-    st.markdown('<div class="px-muted">Login is required to enforce accurate daily free limits.</div>', unsafe_allow_html=True)
-
-    tab_login, tab_signup = st.tabs(["Login", "Create account"])
-
-    with tab_login:
-        with st.form("login_form"):
-            email = st.text_input("Email", placeholder="you@example.com", key="login_email")
-            password = st.text_input("Password", type="password", key="login_password")
-            submit = st.form_submit_button("Login", use_container_width=True)
-            if submit:
-                try:
-                    data = supabase_sign_in(email.strip(), password)
-                    user_obj = data.get("user") or {}
-                    access_token = data.get("access_token", "")
-                    refresh_token = data.get("refresh_token", "")
-                    uid = user_obj.get("id", "")
-                    uemail = user_obj.get("email", email.strip())
-                    if not uid or not access_token:
-                        raise RuntimeError("Login succeeded but user/session data is missing.")
-                    set_auth_session(uid, uemail, access_token, refresh_token)
-                    st.success("Logged in ✅")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-
-    with tab_signup:
-        with st.form("signup_form"):
-            email2 = st.text_input("Email (new account)", placeholder="you@example.com", key="signup_email")
-            password2 = st.text_input("Password", type="password", key="signup_password")
-            submit2 = st.form_submit_button("Create account", use_container_width=True)
-            if submit2:
-                try:
-                    _ = supabase_sign_up(email2.strip(), password2)
-                    st.success("Account created ✅ Now login from the Login tab.")
-                except Exception as e:
-                    st.error(str(e))
-
-    st.markdown("</div>", unsafe_allow_html=True)  # card
-    st.markdown("</div>", unsafe_allow_html=True)  # center-auth
-
-
-# ==========================================================
-# UI — MAIN APP
-# ==========================================================
+# =========================================================
+# LOGIN UI (KEEP)
+# =========================================================
 def render_footer():
     st.markdown(
         """
 <div class="px-footer">
-  Thought and built by <a href="https://www.linkedin.com/in/monika-kushwaha-52443735/" target="_blank">Monika Kushwaha</a><br/>
+  Thought and built by
+  <a href="https://www.linkedin.com/in/monika-kushwaha-52443735/" target="_blank"><b>Monika Kushwaha</b></a><br/>
   QA Engineer | GenAI Product Management | LLMs, RAG, Automation, Performance
 </div>
 """,
         unsafe_allow_html=True,
     )
 
+def render_login():
+    st.markdown('<div class="center-auth"><div class="px-card">', unsafe_allow_html=True)
+    st.markdown('<div class="px-h2">🔐 Login to Promptix</div>', unsafe_allow_html=True)
+    st.markdown('<div class="px-muted">Login is required to enforce accurate daily free limits.</div>', unsafe_allow_html=True)
 
-def sample_fill():
-    st.session_state["context"] = "zepto.com — user added a new address"
-    st.session_state["requirements"] = "User logs in with valid credentials, adds a new address, and sees it saved correctly."
-    st.session_state["additional_info"] = "Consider invalid address fields, network timeouts, duplicates, and location pin issues."
-    st.session_state["acceptance"] = "Address is persisted, displayed in address list, and used during checkout."
-    st.session_state["edge_cases"] = "Empty fields, invalid pincode, duplicate address, server timeout, slow network, app kill/resume."
-    st.session_state["nfr"] = "Basic: response time < 2s on average; no crash; proper error messages."
+    tab_login, tab_signup = st.tabs(["Login", "Create account"])
 
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="you@example.com")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Login", use_container_width=True)
 
-def render_main_app():
-    user = st.session_state.get("user")
-    if not user:
-        render_login()
-        return
-
-    user_id = user["id"]
-    email = user["email"]
-    today = now_local_date_str()
-    used = get_daily_used_count(user_id, today)
-    remaining = max(0, DAILY_FREE_LIMIT - used)
-
-    # Sidebar — AI settings (kept)
-    with st.sidebar:
-        st.markdown("## 🔐 AI Settings")
-
-        provider_labels = [p.label for p in PROVIDERS]
-        provider_map = {p.label: p for p in PROVIDERS}
-        selected_label = st.selectbox("Provider", provider_labels, index=0, key="px_provider")
-        provider = provider_map[selected_label]
-
-        # Provider-specific settings
-        api_key = ""
-        endpoint = DEFAULT_TOGETHER_BASE
-        model = ""
-
-        if provider.vendor == "together":
-            endpoint = st.text_input("API Endpoint", value=DEFAULT_TOGETHER_BASE, key="together_endpoint")
-            # model select
-            model_keys = [m[0] for m in TOGETHER_MODELS]
-            model_labels = [m[1] for m in TOGETHER_MODELS]
-            selected_m = st.selectbox("Model (Together)", model_labels, index=0, key="together_model_label")
-            model = model_keys[model_labels.index(selected_m)]
-
-            if provider.kind == "free":
-                # Use server key
-                if not TOGETHER_API_KEY:
-                    st.warning("TOGETHER_API_KEY is not set on server. Add it in Streamlit secrets.")
-                api_key = TOGETHER_API_KEY
-                st.markdown(f"""
-<div class="px-card" style="margin-top:10px;">
-  <div style="font-weight:700;">Free calls left today:</div>
-  <div style="font-size:1.25rem; margin-top:6px;">{remaining}/{DAILY_FREE_LIMIT}</div>
-  <div class="px-muted">Used today: {used}</div>
-</div>
-""", unsafe_allow_html=True)
-                st.markdown(f"""
-<div class="px-card" style="margin-top:10px; border-color: rgba(60, 255, 140, 0.18);">
-  <div style="font-weight:700;">Using server key from env var:</div>
-  <div style="margin-top:6px;">TOGETHER_API_KEY</div>
-</div>
-""", unsafe_allow_html=True)
+        if submit:
+            if not email or not password:
+                st.error("Please enter email and password.")
             else:
-                api_key = st.text_input("API Key", type="password", placeholder="Paste your Together key", key="together_byok_key")
+                data, err = supabase_sign_in(email.strip(), password)
+                if err:
+                    st.error(f"Login failed: {err}")
+                else:
+                    user_obj = data.get("user") or {}
+                    access_token = data.get("access_token", "")
+                    refresh_token = data.get("refresh_token", "")
+                    if not user_obj.get("id") or not access_token or not refresh_token:
+                        st.error("Login succeeded but tokens are missing. Check Supabase Auth settings.")
+                    else:
+                        apply_auth_session(user_obj, access_token, refresh_token)
+                        st.success("Logged in ✅")
+                        st.rerun()
 
-        elif provider.vendor == "openai":
-            model = st.selectbox("Model", [m[1] for m in OPENAI_MODELS], index=0, key="openai_model_label")
-            model = dict(OPENAI_MODELS).get(model, "gpt-4o-mini") if isinstance(model, str) else "gpt-4o-mini"
-            api_key = st.text_input("API Key", type="password", placeholder="Paste your OpenAI key", key="openai_byok_key")
+    with tab_signup:
+        with st.form("signup_form"):
+            email2 = st.text_input("Email (new account)", placeholder="you@example.com")
+            password2 = st.text_input("Password", type="password")
+            submit2 = st.form_submit_button("Create account", use_container_width=True)
 
-        elif provider.vendor == "gemini":
-            model = st.selectbox("Model", [m[1] for m in GEMINI_MODELS], index=0, key="gemini_model_label")
-            model = dict(GEMINI_MODELS).get(model, "gemini-1.5-flash") if isinstance(model, str) else "gemini-1.5-flash"
-            api_key = st.text_input("API Key", type="password", placeholder="Paste your Gemini key", key="gemini_byok_key")
+        if submit2:
+            if not email2 or not password2:
+                st.error("Please enter email and password.")
+            else:
+                data, err = supabase_sign_up(email2.strip(), password2)
+                if err:
+                    st.error(f"Signup failed: {err}")
+                else:
+                    access_token = (data or {}).get("access_token", "")
+                    refresh_token = (data or {}).get("refresh_token", "")
+                    user_obj = (data or {}).get("user") or {}
+                    if access_token and refresh_token and user_obj.get("id"):
+                        apply_auth_session(user_obj, access_token, refresh_token)
+                        st.success("Account created & logged in ✅")
+                        st.rerun()
+                    else:
+                        st.success("Account created ✅")
+                        st.info("If email confirmation is enabled in Supabase, confirm your email then login.")
 
-        elif provider.vendor == "anthropic":
-            model = st.selectbox("Model", [m[1] for m in ANTHROPIC_MODELS], index=0, key="anthropic_model_label")
-            model = dict(ANTHROPIC_MODELS).get(model, "claude-3-5-sonnet-latest") if isinstance(model, str) else "claude-3-5-sonnet-latest"
-            api_key = st.text_input("API Key", type="password", placeholder="Paste your Anthropic key", key="anthropic_byok_key")
+    st.markdown("</div></div>", unsafe_allow_html=True)
+    render_footer()
 
-        st.markdown("---")
-        st.markdown("### 🔗 Get your API keys")
-        st.markdown("- OpenAI: [Get your API key](https://platform.openai.com/api-keys)")
-        st.markdown("- Gemini: [Get your API key](https://aistudio.google.com/app/apikey)")
-        st.markdown("- Anthropic: [Get your API key](https://console.anthropic.com/settings/keys)")
-        st.markdown("- Together: [Get your API key](https://api.together.ai/settings/api-keys)")
+# =========================================================
+# PROVIDERS (RESTORED)
+# =========================================================
+PROVIDERS = [
+    "Promptix Free (LLaMA via Together)",
+    "Together LLaMA (BYOK)",
+    "OpenAI (BYOK)",
+    "Google Gemini (BYOK)",
+    "Anthropic Claude (BYOK)",
+]
 
-        st.markdown("---")
-        st.markdown("**Logged in:**")
-        st.markdown(f"[{email}](mailto:{email})")
+def render_sidebar(user, used_free: int, remaining_free: int):
+    st.sidebar.markdown("## 🔐 AI Settings")
+    provider = st.sidebar.selectbox("Provider", PROVIDERS, index=0, key="px_provider")
 
-        if st.button("Logout", use_container_width=True):
-            clear_auth_session()
-            st.rerun()
+    cfg = {"provider": provider}
 
-    # Top hero + stats
+    # Common: show endpoint where relevant (as per your older UI)
+    if provider in ("Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)"):
+        endpoint = st.sidebar.text_input("API Endpoint", value=TOGETHER_BASE_URL_DEFAULT, key="px_together_endpoint")
+        cfg["base_url"] = endpoint.strip()
+
+        # model: provide select + custom
+        model_choice = st.sidebar.selectbox(
+            "Model (Together)",
+            options=["(Recommended) " + TOGETHER_MODEL_SAFE_DEFAULT, "(Try) " + TOGETHER_MODEL_ALT_70B, "Custom…"],
+            index=0,
+            key="px_together_model_choice",
+        )
+        if model_choice == "Custom…":
+            model = st.sidebar.text_input("Custom model id", value=TOGETHER_MODEL_SAFE_DEFAULT, key="px_together_model_custom")
+        else:
+            model = model_choice.replace("(Recommended) ", "").replace("(Try) ", "").strip()
+        cfg["model"] = model
+
+    if provider == "Promptix Free (LLaMA via Together)":
+        cfg["api_key"] = TOGETHER_API_KEY_SERVER
+
+        st.sidebar.markdown(
+            f"""
+<div class="kpi-box">
+<b>Free calls left today:</b><br/>
+{remaining_free}/{DAILY_FREE_LIMIT}
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        if TOGETHER_API_KEY_SERVER:
+            st.sidebar.markdown(
+                """
+<div class="kpi-green">
+<b>Using server key from env var:</b><br/>
+TOGETHER_API_KEY
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.sidebar.warning("TOGETHER_API_KEY is missing in Secrets. Free mode won't work.")
+
+    elif provider == "Together LLaMA (BYOK)":
+        cfg["api_key"] = st.sidebar.text_input("Together API Key", type="password", placeholder="Paste your key", key="px_together_key")
+
+    elif provider == "OpenAI (BYOK)":
+        cfg["base_url"] = st.sidebar.text_input("API Endpoint", value=OPENAI_BASE_URL_DEFAULT, key="px_openai_base").strip()
+        cfg["model"] = st.sidebar.text_input("Model", value=OPENAI_MODEL_DEFAULT, key="px_openai_model")
+        cfg["api_key"] = st.sidebar.text_input("OpenAI API Key", type="password", placeholder="Paste your key", key="px_openai_key")
+
+    elif provider == "Google Gemini (BYOK)":
+        cfg["model"] = st.sidebar.text_input("Model", value=GEMINI_MODEL_DEFAULT, key="px_gemini_model")
+        cfg["api_key"] = st.sidebar.text_input("Gemini API Key", type="password", placeholder="Paste your key", key="px_gemini_key")
+
+    elif provider == "Anthropic Claude (BYOK)":
+        cfg["model"] = st.sidebar.text_input("Model", value=ANTHROPIC_MODEL_DEFAULT, key="px_anthropic_model")
+        cfg["api_key"] = st.sidebar.text_input("Anthropic API Key", type="password", placeholder="Paste your key", key="px_anthropic_key")
+
+    st.session_state.llm_cfg = cfg
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔗 Get your API keys")
+    st.sidebar.markdown(
+        """
+<div class="px-links">
+• <a href="https://platform.openai.com/api-keys" target="_blank">OpenAI: Get your API key</a><br/>
+• <a href="https://aistudio.google.com/app/apikey" target="_blank">Gemini: Get your API key</a><br/>
+• <a href="https://console.anthropic.com/" target="_blank">Anthropic: Get your API key</a><br/>
+• <a href="https://api.together.xyz/settings/api-keys" target="_blank">Together: Get your API key</a><br/>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Logged in:**")
+    st.sidebar.markdown(user.get("email", ""))
+    if st.sidebar.button("Logout", use_container_width=True):
+        do_logout()
+
+def send_to_ai(prompt: str) -> str:
+    cfg = st.session_state.get("llm_cfg") or {}
+    provider = cfg.get("provider")
+
+    if provider in ("Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)", "OpenAI (BYOK)"):
+        if not cfg.get("api_key"):
+            raise RuntimeError("Missing API key.")
+        return call_openai_compatible(cfg.get("base_url") or OPENAI_BASE_URL_DEFAULT, cfg["api_key"], cfg.get("model") or OPENAI_MODEL_DEFAULT, prompt)
+
+    if provider == "Google Gemini (BYOK)":
+        if not cfg.get("api_key"):
+            raise RuntimeError("Missing Gemini API key.")
+        return call_gemini(cfg["api_key"], cfg.get("model") or GEMINI_MODEL_DEFAULT, prompt)
+
+    if provider == "Anthropic Claude (BYOK)":
+        if not cfg.get("api_key"):
+            raise RuntimeError("Missing Anthropic API key.")
+        return call_anthropic(cfg["api_key"], cfg.get("model") or ANTHROPIC_MODEL_DEFAULT, prompt)
+
+    raise RuntimeError("Invalid provider.")
+
+# =========================================================
+# MAIN APP
+# =========================================================
+def render_main_app():
+    user = st.session_state.user
+    access_token = st.session_state.access_token
+    usage_date = today_local_iso()
+
+    used_free = get_daily_usage(user["id"], access_token, usage_date)
+    remaining_free = max(0, DAILY_FREE_LIMIT - used_free)
+
+    render_sidebar(user, used_free, remaining_free)
+
+    # HERO
     st.markdown(
-        f"""
-<div class="px-hero">
-  <div style="font-size:2.0rem; font-weight:800;">{APP_TITLE} <span style="font-size:0.9rem; opacity:0.85; margin-left:8px; padding:3px 10px; border-radius:999px; border:1px solid rgba(255,255,255,0.14);">MVP</span></div>
-  <div class="px-muted" style="margin-top:6px;">
+        """
+<div class="hero">
+  <div style="font-size:30px;font-weight:800;">
+    Promptix AI v2 <span class="badge">MVP</span>
+  </div>
+  <div class="subtle">
     Turn product requirements into structured, export-ready test cases — with edge cases, negatives, and multiple formats (Jira/Zephyr/TestRail/BDD/CSV).
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
+    st.write("")
 
-    colA, colB, colC = st.columns([1.7, 0.8, 0.8])
-    with colA:
-        st.markdown(
-            f"""
-<div class="px-pill">
-  <span>👤</span>
-  <span>Logged in as <b>{email}</b></span>
+    # Header strip (like your earlier KPI row)
+    col1, col2, col3 = st.columns([2.4, 1, 1])
+    with col1:
+        st.info(f"👤 Logged in as **{user.get('email','')}**")
+    with col2:
+        st.metric("Daily free limit", f"{DAILY_FREE_LIMIT}/day")
+    with col3:
+        st.metric("Remaining today", str(remaining_free))
+
+    st.markdown("## 🧪 Test Configuration")
+
+    # Sample data button
+    if st.button("🎯 Fill Sample Data", use_container_width=True):
+        fill_sample_data()
+
+    # Defaults
+    st.session_state.setdefault("px_platform", "Web")
+    st.session_state.setdefault("px_role", TESTING_ROLES[0])
+    st.session_state.setdefault("px_test_type", TEST_TYPES[0])
+    st.session_state.setdefault("px_format", TEST_MGMT_FORMATS[0])
+    st.session_state.setdefault("px_custom_format_notes", "")
+
+    st.session_state.setdefault("px_context", "")
+    st.session_state.setdefault("px_requirements", "")
+    st.session_state.setdefault("px_additional", "")
+
+    st.session_state.setdefault("px_cases", 20)
+    st.session_state.setdefault("px_id_prefix", "TC")
+    st.session_state.setdefault("px_priority", "P0/P1/P2")
+
+    st.session_state.setdefault("px_include_comprehensive", True)
+    st.session_state.setdefault("px_include_edge", True)
+    st.session_state.setdefault("px_include_negative", True)
+    st.session_state.setdefault("px_include_boundary", True)
+    st.session_state.setdefault("px_include_ui", True)
+    st.session_state.setdefault("px_include_api", False)
+    st.session_state.setdefault("px_include_accessibility", False)
+    st.session_state.setdefault("px_include_security", False)
+    st.session_state.setdefault("px_include_performance", False)
+
+    # Core fields
+    st.selectbox("Testing Role", TESTING_ROLES, key="px_role")
+    st.selectbox("Test Type", TEST_TYPES, key="px_test_type")
+    st.selectbox("Test Management Format (Import-Ready)", TEST_MGMT_FORMATS, key="px_format")
+
+    if str(st.session_state.px_format).startswith("Custom"):
+        st.text_area("Custom format notes (optional)", key="px_custom_format_notes", height=90, max_chars=2000)
+
+    st.selectbox("Platform", PLATFORMS, key="px_platform")
+
+    st.text_area("Context (What are you testing?)", key="px_context", height=120, max_chars=4000)
+    st.text_area("Requirements (What should it do?)", key="px_requirements", height=140, max_chars=4000)
+    st.text_area("Additional Information", key="px_additional", height=120, max_chars=4000)
+
+    st.markdown(
+        """
+<div class="callout">
+<b>Important</b>
+<ul style="margin:8px 0 0 18px;">
+  <li>Avoid real secrets or client data</li>
+  <li>Review AI output before use</li>
+  <li>Use as assistant — not the only source of truth</li>
+</ul>
 </div>
 """,
-            unsafe_allow_html=True,
-        )
-    with colB:
-        st.markdown(f"<div class='px-muted'>Daily free limit</div><div style='font-size:2.2rem; font-weight:800;'>{DAILY_FREE_LIMIT}/day</div>", unsafe_allow_html=True)
-    with colC:
-        st.markdown(f"<div class='px-muted'>Remaining today</div><div style='font-size:2.2rem; font-weight:800;'>{remaining}</div>", unsafe_allow_html=True)
+        unsafe_allow_html=True,
+    )
 
-    st.markdown("")
-
-    # If free provider selected and remaining == 0: show toast once per day
-    if st.session_state.get("px_provider") == "Promptix Free (LLaMA via Together)" and remaining == 0:
-        if st.session_state.get("_limit_toast_date") != today:
-            toast("0 limits remaining today. Please come back in ~24 hours or switch to BYOK.", icon="⏳")
-            st.session_state["_limit_toast_date"] = today
-
-    # Main configuration form
-    st.markdown("## 🧪 Test Configuration")
-    st.markdown('<div class="px-card">', unsafe_allow_html=True)
-
-    c1, c2 = st.columns([1, 1])
+    # Checkboxes
+    st.write("")
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("🎯 Fill Sample Data", use_container_width=True):
-            sample_fill()
-            toast("Sample data filled ✅", icon="✅")
-
-        role = st.selectbox("Testing Role", TESTING_ROLES, index=0, key="role")
-        test_type = st.selectbox("Test Type", TEST_TYPES, index=0, key="test_type")
-        test_format = st.selectbox("Test Management Format (Import-Ready)", TEST_MANAGEMENT_FORMATS, index=0, key="format")
-        platform = st.selectbox("Platform", PLATFORMS, index=0, key="platform")
-
+        st.checkbox("✅ Comprehensive Coverage", key="px_include_comprehensive")
+        st.checkbox("🧪 Include Edge Cases", key="px_include_edge")
+        st.checkbox("❌ Include Negative Tests", key="px_include_negative")
     with c2:
-        context = st.text_area("Context (What are you testing?)", key="context", placeholder="e.g., Login + OTP, Payments, Search, Checkout")
-        requirements = st.text_area("Requirements (What should it do?)", key="requirements", placeholder="Describe user story / requirement / spec...")
-        acceptance = st.text_area("Acceptance criteria (optional)", key="acceptance", placeholder="List acceptance criteria, bullet points...")
-        edge_cases = st.text_area("Edge cases / negative scenarios (optional)", key="edge_cases", placeholder="Invalid inputs, boundary values, error states...")
-        nfr = st.text_input("Non-functional focus (optional)", key="nfr", placeholder="e.g., latency < 200ms, WCAG, OWASP basics")
+        st.checkbox("📏 Include Boundary/Validation Tests", key="px_include_boundary")
+        st.checkbox("🖥️ Include UI Validations", key="px_include_ui")
+        st.checkbox("🔌 Include API Validations", key="px_include_api")
+    with c3:
+        st.checkbox("♿ Accessibility (basic)", key="px_include_accessibility")
+        st.checkbox("🛡️ Security (basic)", key="px_include_security")
+        st.checkbox("⚡ Performance (basic)", key="px_include_performance")
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # Coverage toggles (restored)
-    st.markdown('<div class="px-card" style="margin-top:14px;">', unsafe_allow_html=True)
-    st.markdown("### Coverage Toggles")
-    tcol1, tcol2, tcol3 = st.columns(3)
-
-    with tcol1:
-        comprehensive = st.checkbox("✅ Comprehensive Coverage", value=True, key="comprehensive")
-        include_edge_cases = st.checkbox("🧪 Include Edge Cases", value=True, key="include_edge_cases")
-        include_negative = st.checkbox("❌ Include Negative Tests", value=True, key="include_negative")
-
-    with tcol2:
-        include_boundary = st.checkbox("📏 Include Boundary/Validation Tests", value=True, key="include_boundary")
-        include_ui = st.checkbox("🖥️ Include UI Validations", value=True, key="include_ui")
-        include_api = st.checkbox("🔌 Include API Validations", value=False, key="include_api")
-
-    with tcol3:
-        include_accessibility = st.checkbox("♿ Accessibility (basic)", value=False, key="include_accessibility")
-        include_security = st.checkbox("🛡️ Security (basic)", value=False, key="include_security")
-        include_performance = st.checkbox("⚡ Performance (basic)", value=False, key="include_performance")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # Advanced prompt engineering (restored + larger editable box)
-    st.markdown('<div class="px-card" style="margin-top:14px;">', unsafe_allow_html=True)
+    # Advanced Prompt Engineering
+    st.write("")
     with st.expander("⚡ Advanced Prompt Engineering", expanded=True):
-        n_cases = st.slider("Number of test cases", min_value=8, max_value=40, value=20, step=1, key="n_cases")
-        tc_prefix = st.text_input("Test Case ID prefix", value="TC", key="tc_prefix")
-        priority_scheme = st.selectbox("Priority scheme", PRIORITY_SCHEMES, index=0, key="priority_scheme")
+        st.slider("Number of test cases", min_value=8, max_value=40, value=int(st.session_state.px_cases), key="px_cases")
+        st.text_input("Test Case ID prefix", value=st.session_state.px_id_prefix, key="px_id_prefix")
+        st.selectbox("Priority scheme", ["P0/P1/P2", "High/Medium/Low", "Critical/Major/Minor"], index=0, key="px_priority")
 
-        btn1, btn2 = st.columns([1, 1])
-        with btn1:
-            gen_adv = st.button("⚡ Generate Advanced Prompt", use_container_width=True)
-        with btn2:
-            send_ai = st.button("🚀 Send to AI", use_container_width=True)
+    st.write("")
+    colA, colB = st.columns([1, 1])
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # Build data dict
-    data = {
-        "role": role,
-        "test_type": test_type,
-        "format": test_format,
-        "platform": platform,
-        "context": context,
-        "requirements": requirements,
-        "acceptance": acceptance,
-        "edge_cases": edge_cases,
-        "nfr": nfr,
-        "comprehensive": comprehensive,
-        "include_edge_cases": include_edge_cases,
-        "include_negative": include_negative,
-        "include_boundary": include_boundary,
-        "include_ui": include_ui,
-        "include_api": include_api,
-        "include_accessibility": include_accessibility,
-        "include_security": include_security,
-        "include_performance": include_performance,
-        "n_cases": n_cases,
-        "tc_prefix": tc_prefix,
-        "priority_scheme": priority_scheme,
-    }
-
-    if "advanced_prompt" not in st.session_state:
-        st.session_state["advanced_prompt"] = ""
-
-    if gen_adv:
-        st.session_state["advanced_prompt"] = build_advanced_prompt(data)
-        st.success("Advanced prompt generated ✅")
-
-    # Advanced prompt box (bigger) + copy button restored
-    if st.session_state.get("advanced_prompt", "").strip():
-        st.markdown('<div class="px-card" style="margin-top:14px;">', unsafe_allow_html=True)
-        st.markdown("### 🧾 Advanced Prompt (Editable)")
-        st.markdown("<div class='px-muted'>You can edit the prompt before sending.</div>", unsafe_allow_html=True)
-
-        adv_text = st.text_area(
-            "",
-            value=st.session_state["advanced_prompt"],
-            key="advanced_prompt_editor",
-            height=320,  # bigger box (restored)
-        )
-        st.session_state["advanced_prompt"] = adv_text
-
-        clipboard_button("Copy Prompt", adv_text, btn_key="copy_adv_prompt_v2")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # Send to AI flow (restored + limit enforcement)
-    if send_ai:
-        # Free provider limit gate
-        if provider.key == "promptix_free":
-            used = get_daily_used_count(user_id, today)  # refresh
-            remaining = max(0, DAILY_FREE_LIMIT - used)
-            if remaining <= 0:
-                toast("0 limits remaining today. Please come back in ~24 hours or switch to BYOK.", icon="⏳")
-                st.warning("Free limit reached. Please come back in ~24 hours (or switch to BYOK in the sidebar).")
+    # Generate prompt
+    with colA:
+        if st.button("⚡ Generate Advanced Prompt", use_container_width=True):
+            if not st.session_state.px_context.strip() or not st.session_state.px_requirements.strip():
+                st.error("Please fill Context and Requirements first.")
             else:
-                # OK to proceed
-                pass
+                prompt_cfg = {
+                    "role": st.session_state.px_role,
+                    "test_type": st.session_state.px_test_type,
+                    "format": st.session_state.px_format,
+                    "custom_format_notes": st.session_state.get("px_custom_format_notes", ""),
+                    "platform": st.session_state.px_platform,
+                    "context": st.session_state.px_context,
+                    "requirements": st.session_state.px_requirements,
+                    "additional": st.session_state.px_additional,
+                    "n_cases": int(st.session_state.px_cases),
+                    "id_prefix": st.session_state.px_id_prefix,
+                    "priority_scheme": st.session_state.px_priority,
+                    "include_comprehensive": st.session_state.px_include_comprehensive,
+                    "include_edge": st.session_state.px_include_edge,
+                    "include_negative": st.session_state.px_include_negative,
+                    "include_boundary": st.session_state.px_include_boundary,
+                    "include_ui": st.session_state.px_include_ui,
+                    "include_api": st.session_state.px_include_api,
+                    "include_accessibility": st.session_state.px_include_accessibility,
+                    "include_security": st.session_state.px_include_security,
+                    "include_performance": st.session_state.px_include_performance,
+                }
+                st.session_state.advanced_prompt = build_advanced_prompt(prompt_cfg)
+                st.success("Advanced prompt generated ✅")
 
-        # Validate API key for BYOK
-        if provider.needs_key and not api_key:
-            st.error("Please add your API key in the sidebar for the selected provider (BYOK).")
-        else:
-            # Choose prompt
-            prompt_to_send = st.session_state.get("advanced_prompt", "").strip()
-            if not prompt_to_send:
-                prompt_to_send = build_advanced_prompt(data)
+    # Send to AI
+    with colB:
+        can_send = bool(st.session_state.get("advanced_prompt"))
+        if st.button("🚀 Send to AI", use_container_width=True, disabled=not can_send):
+            cfg = st.session_state.get("llm_cfg") or {}
+            provider = cfg.get("provider")
 
-            try:
-                with st.spinner("Generating..."):
-                    if provider.vendor == "together":
-                        # Together uses chat messages
-                        messages = [
-                            {"role": "system", "content": "You are a senior QA engineer. Output clean, import-ready test cases."},
-                            {"role": "user", "content": prompt_to_send},
-                        ]
-                        output = call_together_chat(api_key=api_key, model=model, messages=messages, base_url=endpoint)
-                    elif provider.vendor == "openai":
-                        messages = [
-                            {"role": "system", "content": "You are a senior QA engineer. Output clean, import-ready test cases."},
-                            {"role": "user", "content": prompt_to_send},
-                        ]
-                        output = call_openai_chat(api_key=api_key, model=model, messages=messages)
-                    elif provider.vendor == "gemini":
-                        output = call_gemini(api_key=api_key, model=model, prompt=prompt_to_send)
-                    elif provider.vendor == "anthropic":
-                        output = call_anthropic(api_key=api_key, model=model, prompt=prompt_to_send)
-                    else:
-                        raise RuntimeError("Unsupported provider")
+            # Enforce free limit only for Promptix Free
+            if provider == "Promptix Free (LLaMA via Together)":
+                if remaining_free <= 0:
+                    st.error("Daily free limit reached. Please come back tomorrow or use BYOK.")
+                    return
+                if not TOGETHER_API_KEY_SERVER:
+                    st.error("TOGETHER_API_KEY is missing in Secrets. Free mode can't run.")
+                    return
 
-                # Increment usage only for free provider
-                if provider.key == "promptix_free":
-                    new_used = increment_daily_usage(user_id, today)
-                    new_remaining = max(0, DAILY_FREE_LIMIT - new_used)
-                    st.success(f"Done ✅ Free calls left today: {new_remaining}/{DAILY_FREE_LIMIT} (Used: {new_used})")
-                    if new_remaining == 0:
-                        toast("0 limits remaining today. Please come back in ~24 hours.", icon="⏳")
+            # BYOK key required
+            if provider != "Promptix Free (LLaMA via Together)" and not cfg.get("api_key"):
+                st.error("Please add your API key in the sidebar.")
+                return
 
-                # Show output (restored) + copy answer
-                st.markdown('<div class="px-card" style="margin-top:14px;">', unsafe_allow_html=True)
-                st.markdown("## ✅ AI Output")
-                st.text_area("", value=output, height=420, key="ai_output_box")
-                clipboard_button("Copy Answer", output, btn_key="copy_ai_output_v2")
-                st.markdown("</div>", unsafe_allow_html=True)
+            # Best-effort model check for Together to reduce the error you saw
+            if provider in ("Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)"):
+                key_for_check = cfg.get("api_key") or ""
+                model_set = together_list_models(key_for_check) if key_for_check else None
+                chosen_model = cfg.get("model") or ""
+                if model_set is not None and chosen_model and chosen_model not in model_set:
+                    st.warning(
+                        f"Selected model may not be available for this key. "
+                        f"Try '{TOGETHER_MODEL_SAFE_DEFAULT}' or pick from Together models."
+                    )
 
-            except Exception as e:
-                st.error(f"AI request failed: {str(e)[:1200]}")
+            with st.spinner("Sending to AI…"):
+                try:
+                    output = send_to_ai(st.session_state.advanced_prompt)
+                except Exception as e:
+                    msg = str(e)
+
+                    # Auto-fix the common Together model error you showed
+                    if "Unable to access model" in msg and "together" in (cfg.get("base_url") or "").lower():
+                        st.error(msg)
+                        st.info(
+                            "Fix: your Together key can't access this model. "
+                            f"Switching to safer default: {TOGETHER_MODEL_SAFE_DEFAULT}"
+                        )
+                        # force safer model for Together
+                        if provider in ("Promptix Free (LLaMA via Together)", "Together LLaMA (BYOK)"):
+                            st.session_state["px_together_model_choice"] = "(Recommended) " + TOGETHER_MODEL_SAFE_DEFAULT
+                            st.session_state.llm_cfg["model"] = TOGETHER_MODEL_SAFE_DEFAULT
+                        return
+
+                    st.error(f"AI request failed: {msg}")
+                    return
+
+            # Count usage after success (free only)
+            if provider == "Promptix Free (LLaMA via Together)":
+                new_used = increment_daily_usage(user["id"], access_token, usage_date)
+                new_remaining = max(0, DAILY_FREE_LIMIT - new_used)
+                st.success(f"Done ✅  Free calls left today: {new_remaining}/{DAILY_FREE_LIMIT}")
+            else:
+                st.success("Done ✅")
+
+            st.session_state.last_output = output
+
+    # PROMPT (Bigger box) + Copy
+    st.write("")
+    st.subheader("🧾 Advanced Prompt (Editable)")
+
+    st.text_area(
+        label="You can edit the prompt before sending",
+        key="advanced_prompt",
+        height=420,  # bigger (your complaint)
+        placeholder="Click 'Generate Advanced Prompt' to create one…",
+    )
+
+    if st.session_state.get("advanced_prompt"):
+        clipboard_button("📋 Copy Advanced Prompt", st.session_state.get("advanced_prompt", ""), "copy_prompt_btn")
+
+    # OUTPUT + Copy answer (restored) + Download
+    if st.session_state.get("last_output"):
+        st.write("")
+        st.subheader("✅ AI Response")
+
+        # show output (markdown) + also provide raw text for copy
+        st.markdown(st.session_state.last_output)
+
+        cdl1, cdl2 = st.columns([1, 1])
+        with cdl1:
+            clipboard_button("📋 Copy AI Response", st.session_state.get("last_output", ""), "copy_output_btn")
+        with cdl2:
+            st.download_button(
+                "⬇️ Download Output (.md)",
+                data=st.session_state.last_output.encode("utf-8"),
+                file_name=f"promptix_output_{usage_date}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
 
     render_footer()
 
+# =========================================================
+# ENTRY
+# =========================================================
+try_bootstrap_session_from_cookie()
 
-# ==========================================================
-# APP FLOW
-# ==========================================================
-# 1) If a cookie operation is queued, execute it (ONE cookie call) and rerun
-process_cookie_queue_once()
-
-# 2) Bootstrap from cookie (ONE cookie read call)
-bootstrap_session_from_cookie_once()
-
-# 3) Render correct page
-if not st.session_state.get("user"):
+if not is_authed():
     render_login()
-else:
-    render_main_app()
+    st.stop()
+
+render_main_app()
