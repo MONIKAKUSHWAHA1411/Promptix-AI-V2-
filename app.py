@@ -20,13 +20,15 @@ LOCAL_TZ = "Asia/Kolkata"  # used only for display messaging (date reset is per 
 TOGETHER_DEFAULT_ENDPOINT = "https://api.together.xyz/v1/chat/completions"
 TOGETHER_DEFAULT_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
 
-# Supabase (optional but supported)
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", "")).strip()
-SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", "")).strip()
+# FIX #4: Supabase credentials moved to lazy-load helper — NOT read at module level
+# (avoids calling st.secrets before st.set_page_config)
 
-# If you don't have Supabase configured, the app still works.
-# It will keep a per-user usage counter in server memory (stable across reruns/reloads),
-# keyed by email. Supabase is used for real auth if configured.
+
+def _get_supabase_config() -> Tuple[str, str]:
+    """Lazy-load Supabase config after page setup."""
+    url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", "")).strip()
+    key = st.secrets.get("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", "")).strip()
+    return url, key
 
 
 # =========================================================
@@ -150,12 +152,14 @@ def inc_used_today(user_key: str) -> int:
 # AUTH (Supabase optional)
 # =========================================================
 def supabase_enabled() -> bool:
-    return bool(SUPABASE_URL and SUPABASE_ANON_KEY)
+    url, key = _get_supabase_config()
+    return bool(url and key)
 
 
 def _sb_headers(auth_bearer: Optional[str] = None) -> Dict[str, str]:
+    _, anon_key = _get_supabase_config()
     headers = {
-        "apikey": SUPABASE_ANON_KEY,
+        "apikey": anon_key,
         "Content-Type": "application/json",
     }
     if auth_bearer:
@@ -164,8 +168,9 @@ def _sb_headers(auth_bearer: Optional[str] = None) -> Dict[str, str]:
 
 
 def supabase_signup(email: str, password: str) -> Tuple[bool, str]:
+    supabase_url, _ = _get_supabase_config()
     try:
-        url = f"{SUPABASE_URL}/auth/v1/signup"
+        url = f"{supabase_url}/auth/v1/signup"
         r = requests.post(url, headers=_sb_headers(), json={"email": email, "password": password}, timeout=20)
         if r.status_code in (200, 201):
             return True, "Account created. Please login."
@@ -175,8 +180,9 @@ def supabase_signup(email: str, password: str) -> Tuple[bool, str]:
 
 
 def supabase_login(email: str, password: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    supabase_url, _ = _get_supabase_config()
     try:
-        url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
+        url = f"{supabase_url}/auth/v1/token?grant_type=password"
         r = requests.post(url, headers=_sb_headers(), json={"email": email, "password": password}, timeout=20)
         if r.status_code == 200:
             data = r.json()
@@ -209,6 +215,9 @@ def init_session():
     st.session_state.setdefault("req_text", "")
 
     st.session_state.setdefault("_show_limit_dialog", False)
+
+    # FIX #7: per-session generation history (last 5)
+    st.session_state.setdefault("generation_history", [])
 
 
 init_session()
@@ -249,9 +258,10 @@ def render_limit_dialog():
 
 
 # =========================================================
-# LLM CALLS (keeps existing behavior: “Send to AI”)
+# LLM CALLS (keeps existing behavior: "Send to AI")
+# FIX #5: max_tokens increased from 1400 to 2500 in all calls
 # =========================================================
-def call_chat_completions(endpoint: str, api_key: str, model: str, messages, temperature=0.2, max_tokens=1400) -> str:
+def call_chat_completions(endpoint: str, api_key: str, model: str, messages, temperature=0.2, max_tokens=2500) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -270,10 +280,14 @@ def call_chat_completions(endpoint: str, api_key: str, model: str, messages, tem
 
 
 def call_gemini(api_key: str, model: str, prompt: str) -> str:
-    # Minimal Gemini REST call (generateContent)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    # FIX #1: API key passed as x-goog-api-key header instead of URL query param
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=60)
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
     r.raise_for_status()
     data = r.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -288,7 +302,7 @@ def call_anthropic(api_key: str, model: str, system: str, user_prompt: str) -> s
     }
     payload = {
         "model": model,
-        "max_tokens": 1400,
+        "max_tokens": 2500,  # FIX #5: increased from 1400
         "system": system,
         "messages": [{"role": "user", "content": user_prompt}],
     }
@@ -365,6 +379,35 @@ Instructions:
 - Add a small section for "Non-functional considerations" if relevant (performance/security/accessibility).
 - Keep output clean and import-ready for the selected format.
 """.strip()
+
+
+# =========================================================
+# FIX #6: Smart download filename based on format
+# =========================================================
+def _download_filename(format_type: str) -> str:
+    fmt = format_type.lower()
+    if "bdd" in fmt or "gherkin" in fmt or "cucumber" in fmt:
+        return "test_cases.feature"
+    elif "csv" in fmt:
+        return "test_cases.csv"
+    else:
+        return "test_cases.txt"
+
+
+# =========================================================
+# FIX #7: Generation history helpers
+# =========================================================
+def _add_to_history(context: str, format_type: str, ai_response: str) -> None:
+    """Prepend a generation record; keep only the last 5."""
+    history = st.session_state.get("generation_history", [])
+    record = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "context_preview": (context or "").strip()[:80],
+        "format_type": format_type,
+        "ai_response": ai_response,
+    }
+    history.insert(0, record)
+    st.session_state["generation_history"] = history[:5]
 
 
 # =========================================================
@@ -523,14 +566,14 @@ def render_sidebar(user_key: str):
 
     st.sidebar.markdown("---")
 
-    # Logout (fixes logout flicker by immediate rerun + stop)
+    # FIX #3: removed dead st.stop() after st.rerun() — st.rerun() raises RerunException
+    # so st.stop() was unreachable
     if st.sidebar.button("Logout", key="logout_btn", use_container_width=True):
         st.session_state.logged_in = False
         st.session_state.user_email = ""
         st.session_state.user_id = ""
         st.session_state.access_token = ""
         st.rerun()
-        st.stop()
 
     st.sidebar.caption("Security: never hardcode or commit keys to GitHub.")
 
@@ -619,13 +662,29 @@ def render_main_app():
 
     with colB:
         st.markdown("### 🤖 AI Response")
+        # FIX #9: editable text area for the response (kept for editing)
         st.session_state.ai_response = st.text_area(
             "",
             value=st.session_state.ai_response,
-            height=340,
+            height=200,
             key="ai_response_textarea",
             label_visibility="collapsed",
         )
+
+        # FIX #9: also render the AI response in a st.code block for easy copy
+        if st.session_state.ai_response:
+            st.code(st.session_state.ai_response, language="markdown")
+
+        # FIX #6: download button with smart filename
+        if st.session_state.ai_response:
+            filename = _download_filename(st.session_state.format_type)
+            st.download_button(
+                label=f"⬇️ Download ({filename})",
+                data=st.session_state.ai_response,
+                file_name=filename,
+                mime="text/plain",
+                key="download_ai_response_btn",
+            )
 
     st.markdown("---")
 
@@ -678,7 +737,7 @@ def render_main_app():
                         ],
                     )
 
-                    # ✅ FIX: decrement by 1 after successful call
+                    # Increment counter after successful call
                     inc_used_today(user_key)
 
                 elif provider == "Together (Your key)":
@@ -741,6 +800,13 @@ def render_main_app():
 
             st.session_state.ai_response = out
 
+            # FIX #7: save to generation history
+            _add_to_history(
+                context=st.session_state.context_text,
+                format_type=st.session_state.format_type,
+                ai_response=out,
+            )
+
             # If limit just reached, show popup next
             if provider == "Promptix Free (LLAMA via Together)":
                 used_now = get_used_today(user_key)
@@ -750,9 +816,33 @@ def render_main_app():
             st.rerun()
 
         except requests.HTTPError as e:
-            st.error(f"AI call failed (HTTP). {e}")
+            # FIX #8: human-readable error with actionable tip
+            st.error(
+                f"AI call failed (HTTP {e.response.status_code if e.response is not None else 'unknown'}). "
+                f"Please check your API key or try a different provider."
+            )
         except Exception as e:
-            st.error(f"AI call failed. {e}")
+            # FIX #8: human-readable error with actionable tip
+            st.error(
+                f"AI call failed: {e}\n\n"
+                f"Tip: Check your API key or try a different provider."
+            )
+
+    # =========================================================
+    # FIX #7: Generation History expander
+    # =========================================================
+    history = st.session_state.get("generation_history", [])
+    if history:
+        with st.expander("📜 History (last 5 generations)", expanded=False):
+            for i, record in enumerate(history):
+                st.markdown(
+                    f"**{record['timestamp']}** — Format: `{record['format_type']}`  "
+                    f"Context: _{record['context_preview'] or '(empty)'}{'...' if len(record.get('context_preview','')) == 80 else ''}_"
+                )
+                if st.button(f"Re-load #{i + 1}", key=f"history_reload_{i}"):
+                    st.session_state.ai_response = record["ai_response"]
+                    st.rerun()
+                st.markdown("---")
 
 
 # =========================================================
